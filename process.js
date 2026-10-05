@@ -62,13 +62,31 @@ async function extractFrames(videoPath) {
   }
 }
 
+// How many frames to classify with Claude at once. Keeps a lecture video's
+// worth of frames from fully serializing while not flooding the machine
+// with dozens of concurrent claude CLI subprocesses.
+const FRAME_CLASSIFY_CONCURRENCY = 4;
+
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (nextIndex < items.length) {
+      const i = nextIndex++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
 async function filterFrames(framesDir) {
   const frames = fs.readdirSync(framesDir).filter(f => f.endsWith('.png')).sort();
 
-  console.log(`\n[3/7] Classifying ${frames.length} candidate frame(s) with Claude...`);
-  let keptCount = 0;
-  for (let i = 0; i < frames.length; i++) {
-    const framePath = path.join(framesDir, frames[i]);
+  console.log(`[filter] Classifying ${frames.length} candidate frame(s) with Claude (${FRAME_CLASSIFY_CONCURRENCY} at a time)...`);
+
+  const keptFlags = await mapWithConcurrency(frames, FRAME_CLASSIFY_CONCURRENCY, async (frameFile) => {
+    const framePath = path.join(framesDir, frameFile);
     const prompt = `Look at the image at this path: ${framePath}
 
 This is a frame extracted from a computer science lecture video. Decide whether it is worth keeping as a reference screenshot in study notes.
@@ -78,17 +96,23 @@ Respond with exactly one word, USEFUL or DISCARD, and nothing else.
 - DISCARD: the frame is blank, a blurry transition, or just shows a presenter/talking head with no supporting visual.`;
 
     try {
-      const output = execSync(`claude -p --add-dir "${framesDir}" --allowedTools Read`, { input: prompt, encoding: 'utf-8' }).trim();
-      if (/^USEFUL/i.test(output)) {
-        keptCount++;
-      } else {
-        fs.unlinkSync(framePath);
-      }
+      const output = await runClaude(prompt, `--add-dir "${framesDir}" --allowedTools Read`);
+      return /^USEFUL/i.test(output);
     } catch (err) {
-      console.error(`Frame classification failed for ${frames[i]}:`, err.message);
-      fs.unlinkSync(framePath);
+      console.error(`Frame classification failed for ${frameFile}:`, err.message);
+      return false;
     }
-  }
+  });
+
+  let keptCount = 0;
+  frames.forEach((frameFile, i) => {
+    if (keptFlags[i]) {
+      keptCount++;
+    } else {
+      fs.unlinkSync(path.join(framesDir, frameFile));
+    }
+  });
+
   console.log(`✓ Kept ${keptCount}/${frames.length} useful frame(s): ${framesDir}`);
   return framesDir;
 }
