@@ -191,6 +191,59 @@ ${fixedText}`;
   }
 }
 
+async function generateDocx(notesPath, framesDir) {
+  const outputDir = path.dirname(notesPath);
+  const baseName = path.basename(notesPath, '.md');
+  const docxPath = path.join(outputDir, `${baseName}.docx`);
+
+  console.log(`\nInserting screenshots and generating DOCX...`);
+
+  const notesContent = fs.readFileSync(notesPath, 'utf-8');
+  const frameFiles = fs.existsSync(framesDir)
+    ? fs.readdirSync(framesDir).filter(f => f.endsWith('.png')).sort()
+    : [];
+
+  if (frameFiles.length === 0) {
+    console.log('No kept frames to insert; converting notes as-is.');
+  }
+
+  const framesDirName = path.basename(framesDir);
+  const prompt = `Here are study notes in markdown, followed by a list of available screenshot filenames extracted from the source lecture video. Insert markdown image references (e.g. "![description](${framesDirName}/<filename>)") at the points in the notes where each screenshot is most relevant (e.g. a diagram next to the section explaining it, a code screenshot next to the code walkthrough). Not every screenshot needs to be used if none of them fit a section well, and don't force irrelevant placements. Output the full updated markdown with the image references inserted, and nothing else (no commentary).
+
+Available screenshot filenames (in the "${framesDirName}" folder, relative to this document):
+${frameFiles.map(f => `- ${f}`).join('\n')}
+
+Study notes:
+${notesContent}`;
+
+  let finalMarkdown = notesContent;
+  if (frameFiles.length > 0) {
+    try {
+      finalMarkdown = execSync(`claude -p`, { input: prompt, encoding: 'utf-8' }).trim();
+    } catch (err) {
+      console.error('Claude CLI failed to insert screenshots, converting notes as-is:', err.message);
+    }
+  }
+
+  const annotatedPath = path.join(outputDir, `${baseName}.with-images.md`);
+  fs.writeFileSync(annotatedPath, finalMarkdown, 'utf-8');
+
+  try {
+    execSync(`pandoc "${annotatedPath}" -o "${docxPath}"`, {
+      cwd: outputDir,
+      stdio: 'inherit'
+    });
+    console.log(`✓ DOCX generated: ${docxPath}`);
+  } catch (err) {
+    console.error('pandoc failed (is it installed and on PATH?):', err.message);
+    process.exit(1);
+  } finally {
+    fs.unlinkSync(annotatedPath);
+  }
+
+  return docxPath;
+}
+
 async function processSingleVideo(videoPath) {
   try {
     const audioPath = await extractAudio(videoPath);
