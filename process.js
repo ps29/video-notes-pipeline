@@ -1,16 +1,33 @@
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
-const { execSync } = require('child_process');
+const crypto = require('crypto');
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const execAsync = promisify(exec);
+
+const EXEC_OPTS = { encoding: 'utf-8', maxBuffer: 1024 * 1024 * 100 };
+
+// Runs the claude CLI with a prompt, passed via a temp file + stdin redirect
+// (async child_process.exec doesn't support the `input` option execSync has).
+async function runClaude(prompt, extraArgs = '') {
+  const tmpFile = path.join(os.tmpdir(), `claude-prompt-${crypto.randomUUID()}.txt`);
+  fs.writeFileSync(tmpFile, prompt, 'utf-8');
+  try {
+    const { stdout } = await execAsync(`claude -p ${extraArgs} < "${tmpFile}"`, EXEC_OPTS);
+    return stdout.trim();
+  } finally {
+    fs.unlinkSync(tmpFile);
+  }
+}
 
 async function extractAudio(videoPath) {
   const baseName = path.basename(videoPath, path.extname(videoPath));
   const audioPath = path.join(path.dirname(videoPath), `${baseName}.wav`);
 
-  console.log(`[1/7] Extracting audio from ${videoPath}...`);
+  console.log(`[audio] Extracting audio from ${videoPath}...`);
   try {
-    execSync(`ffmpeg -i "${videoPath}" -ar 16000 -ac 1 -y "${audioPath}"`, {
-      stdio: 'inherit'
-    });
+    await execAsync(`ffmpeg -i "${videoPath}" -ar 16000 -ac 1 -y "${audioPath}"`, EXEC_OPTS);
     console.log(`✓ Audio extracted: ${audioPath}`);
     return audioPath;
   } catch (err) {
@@ -29,12 +46,12 @@ async function extractFrames(videoPath) {
   const baseName = path.basename(videoPath, path.extname(videoPath));
   const framesDir = path.join(path.dirname(videoPath), `${baseName}-frames`);
 
-  console.log(`\n[2/7] Extracting candidate frames from ${videoPath}...`);
+  console.log(`[frames] Extracting candidate frames from ${videoPath}...`);
   fs.mkdirSync(framesDir, { recursive: true });
   try {
-    execSync(
+    await execAsync(
       `ffmpeg -i "${videoPath}" -vf "select='gt(scene,${SCENE_CHANGE_THRESHOLD})',showinfo" -vsync vfr "${path.join(framesDir, 'candidate_%04d.png')}"`,
-      { stdio: 'inherit' }
+      EXEC_OPTS
     );
     const frameCount = fs.readdirSync(framesDir).filter(f => f.endsWith('.png')).length;
     console.log(`✓ Extracted ${frameCount} candidate frame(s): ${framesDir}`);
@@ -81,13 +98,11 @@ async function transcribe(audioPath) {
   const outputDir = path.dirname(audioPath);
   const transcriptPath = path.join(outputDir, `${baseName}.raw.txt`);
 
-  console.log(`\n[4/7] Transcribing audio with faster-whisper...`);
+  console.log(`[transcribe] Transcribing audio with faster-whisper...`);
   try {
     const venvPython = path.join(__dirname, '.venv', 'Scripts', 'python.exe');
-    const output = execSync(`"${venvPython}" "${path.join(__dirname, 'transcribe.py')}" "${audioPath}"`, {
-      encoding: 'utf-8'
-    });
-    fs.writeFileSync(transcriptPath, output.trim(), 'utf-8');
+    const { stdout } = await execAsync(`"${venvPython}" "${path.join(__dirname, 'transcribe.py')}" "${audioPath}"`, EXEC_OPTS);
+    fs.writeFileSync(transcriptPath, stdout.trim(), 'utf-8');
     console.log(`✓ Raw transcript saved: ${transcriptPath}`);
     return transcriptPath;
   } catch (err) {
@@ -102,18 +117,15 @@ async function fixTranscript(transcriptPath) {
   const outputDir = path.dirname(transcriptPath);
   const fixedPath = path.join(outputDir, `${baseName}.fixed.md`);
 
-  console.log(`\n[5/7] Fixing transcript with Claude...`);
+  console.log(`[fix] Fixing transcript with Claude...`);
   const prompt = `You are correcting a speech-to-text transcript of a computer science lecture or educational video. Fix mis-transcribed technical terms, names, programming concepts, and phrases using context. Preserve the original meaning and structure. Output only the corrected transcript, nothing else.
 
 Transcript to fix:
 ${rawText}`;
 
   try {
-    const output = execSync(`claude -p`, {
-      input: prompt,
-      encoding: 'utf-8'
-    });
-    fs.writeFileSync(fixedPath, output.trim(), 'utf-8');
+    const output = await runClaude(prompt);
+    fs.writeFileSync(fixedPath, output, 'utf-8');
     console.log(`✓ Fixed transcript saved: ${fixedPath}`);
     return fixedPath;
   } catch (err) {
@@ -127,7 +139,7 @@ async function generateNotes(fixedTranscriptPath) {
   const baseName = path.basename(fixedTranscriptPath, path.extname(fixedTranscriptPath)).replace('.raw', '');
   const outputDir = path.dirname(fixedTranscriptPath);
 
-  console.log(`\n[6/7] Generating study notes with Claude...`);
+  console.log(`[notes] Generating study notes with Claude...`);
   const prompt = `This is a non-interactive, one-shot generation — you cannot ask clarifying questions or present options. If you're torn between two approaches (e.g., how deep to go on a topic), always choose the more thorough, more explanatory one. When supplementing with outside knowledge beyond what the video said, label it clearly (e.g., under "Additional context" or inline as "(not covered in the video:)") so the reader can tell what's the video's framing vs. your addition. Further the goal is to create detailed, self-contained markdown study notes from this computer science video transcript. The reader should be able to fully understand and learn the material WITHOUT watching the video — treat this as writing the explanation the video should have given, not just summarizing what was said.
 
 Start with:
@@ -154,10 +166,7 @@ Transcript from video:
 ${fixedText}`;
 
   try {
-    const notesOutput = execSync(`claude -p`, {
-      input: prompt,
-      encoding: 'utf-8'
-    }).trim();
+    const notesOutput = await runClaude(prompt);
 
     // Extract title from the markdown (first # heading)
     const titleMatch = notesOutput.match(/^#\s+(.+)$/m);
@@ -197,7 +206,7 @@ async function generateDocx(notesPath, framesDir) {
   const baseName = path.basename(notesPath, '.md');
   const docxPath = path.join(outputDir, `${baseName}.docx`);
 
-  console.log(`\n[7/7] Inserting screenshots and generating DOCX...`);
+  console.log(`[docx] Inserting screenshots and generating DOCX...`);
 
   const notesContent = fs.readFileSync(notesPath, 'utf-8');
   const frameFiles = fs.existsSync(framesDir)
@@ -220,7 +229,7 @@ ${notesContent}`;
   let finalMarkdown = notesContent;
   if (frameFiles.length > 0) {
     try {
-      finalMarkdown = execSync(`claude -p`, { input: prompt, encoding: 'utf-8' }).trim();
+      finalMarkdown = await runClaude(prompt);
     } catch (err) {
       console.error('Claude CLI failed to insert screenshots, converting notes as-is:', err.message);
     }
@@ -230,17 +239,14 @@ ${notesContent}`;
   fs.writeFileSync(annotatedPath, finalMarkdown, 'utf-8');
 
   try {
-    execSync(`pandoc "${annotatedPath}" -o "${docxPath}"`, {
-      cwd: outputDir,
-      stdio: 'inherit'
-    });
+    await execAsync(`pandoc "${annotatedPath}" -o "${docxPath}"`, { ...EXEC_OPTS, cwd: outputDir });
     console.log(`✓ DOCX generated: ${docxPath}`);
   } catch (err) {
+    fs.unlinkSync(annotatedPath);
     console.error('pandoc failed (is it installed and on PATH?):', err.message);
     process.exit(1);
-  } finally {
-    fs.unlinkSync(annotatedPath);
   }
+  fs.unlinkSync(annotatedPath);
 
   return docxPath;
 }
