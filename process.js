@@ -61,7 +61,7 @@ Respond with exactly one word, USEFUL or DISCARD, and nothing else.
 - DISCARD: the frame is blank, a blurry transition, or just shows a presenter/talking head with no supporting visual.`;
 
     try {
-      const output = execSync(`claude -p`, { input: prompt, encoding: 'utf-8' }).trim();
+      const output = execSync(`claude -p --add-dir "${framesDir}" --allowedTools Read`, { input: prompt, encoding: 'utf-8' }).trim();
       if (/^USEFUL/i.test(output)) {
         keptCount++;
       } else {
