@@ -1,0 +1,18 @@
+{
+  "name": "video-notes-pipeline",
+  "version": "1.0.0",
+  "description": "Extract text from video, fix transcription errors, and generate study notes",
+  "main": "process.js",
+  "scripts": {
+    "start": "node process.js"
+  },
+  "keywords": [
+    "video",
+    "transcription",
+    "whisper",
+    "claude",
+    "study-notes"
+  ],
+  "author": "",
+  "license": "MIT"
+}

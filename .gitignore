@@ -1,3 +1,10 @@
+# Project-specific
+*.wav
+node_modules/
+CLAUDE.md
+*.pem
+*.key
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
