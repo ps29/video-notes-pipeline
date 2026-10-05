@@ -277,10 +277,19 @@ ${notesContent}`;
 
 async function processSingleVideo(videoPath) {
   try {
-    const audioPath = await extractAudio(videoPath);
-    const framesDir = await extractFrames(videoPath);
-    await filterFrames(framesDir);
-    const transcriptPath = await transcribe(audioPath);
+    // extractAudio/extractFrames both only need the source video -- run together.
+    const [audioPath, framesDir] = await Promise.all([
+      extractAudio(videoPath),
+      extractFrames(videoPath)
+    ]);
+
+    // filterFrames depends on framesDir, transcribe depends on audioPath --
+    // neither depends on the other's output, so run together too.
+    const [, transcriptPath] = await Promise.all([
+      filterFrames(framesDir),
+      transcribe(audioPath)
+    ]);
+
     const fixedPath = await fixTranscript(transcriptPath);
     const notesPath = await generateNotes(fixedPath);
     const docxPath = await generateDocx(notesPath, framesDir);
