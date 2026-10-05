@@ -20,9 +20,10 @@ async function extractAudio(videoPath) {
 }
 
 // Scene-change threshold: higher = fewer, more distinct candidate frames.
-// 0.3 is a reasonable default for slide/code-heavy lecture content; lower it
-// if useful frames are being missed, raise it if too many near-duplicates appear.
-const SCENE_CHANGE_THRESHOLD = 0.3;
+// Screen-capture lecture recordings (slides/code, mostly static camera) have
+// much lower scene-score variance than real camera footage: 0.02 is tuned for
+// that case. Raise it if too many near-duplicate frames come through.
+const SCENE_CHANGE_THRESHOLD = 0.02;
 
 async function extractFrames(videoPath) {
   const baseName = path.basename(videoPath, path.extname(videoPath));
