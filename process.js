@@ -19,6 +19,62 @@ async function extractAudio(videoPath) {
   }
 }
 
+// Scene-change threshold: higher = fewer, more distinct candidate frames.
+// 0.3 is a reasonable default for slide/code-heavy lecture content; lower it
+// if useful frames are being missed, raise it if too many near-duplicates appear.
+const SCENE_CHANGE_THRESHOLD = 0.3;
+
+async function extractFrames(videoPath) {
+  const baseName = path.basename(videoPath, path.extname(videoPath));
+  const framesDir = path.join(path.dirname(videoPath), `${baseName}-frames`);
+
+  console.log(`\nExtracting candidate frames from ${videoPath}...`);
+  fs.mkdirSync(framesDir, { recursive: true });
+  try {
+    execSync(
+      `ffmpeg -i "${videoPath}" -vf "select='gt(scene,${SCENE_CHANGE_THRESHOLD})',showinfo" -vsync vfr "${path.join(framesDir, 'candidate_%04d.png')}"`,
+      { stdio: 'inherit' }
+    );
+    const frameCount = fs.readdirSync(framesDir).filter(f => f.endsWith('.png')).length;
+    console.log(`✓ Extracted ${frameCount} candidate frame(s): ${framesDir}`);
+    return framesDir;
+  } catch (err) {
+    console.error('ffmpeg frame extraction failed:', err.message);
+    process.exit(1);
+  }
+}
+
+async function filterFrames(framesDir) {
+  const frames = fs.readdirSync(framesDir).filter(f => f.endsWith('.png')).sort();
+
+  console.log(`\nClassifying ${frames.length} candidate frame(s) with Claude...`);
+  let keptCount = 0;
+  for (let i = 0; i < frames.length; i++) {
+    const framePath = path.join(framesDir, frames[i]);
+    const prompt = `Look at the image at this path: ${framePath}
+
+This is a frame extracted from a computer science lecture video. Decide whether it is worth keeping as a reference screenshot in study notes.
+
+Respond with exactly one word, USEFUL or DISCARD, and nothing else.
+- USEFUL: the frame shows a diagram, code snippet, chart, equation, slide text, or other reference-worthy visual content.
+- DISCARD: the frame is blank, a blurry transition, or just shows a presenter/talking head with no supporting visual.`;
+
+    try {
+      const output = execSync(`claude -p`, { input: prompt, encoding: 'utf-8' }).trim();
+      if (/^USEFUL/i.test(output)) {
+        keptCount++;
+      } else {
+        fs.unlinkSync(framePath);
+      }
+    } catch (err) {
+      console.error(`Frame classification failed for ${frames[i]}:`, err.message);
+      fs.unlinkSync(framePath);
+    }
+  }
+  console.log(`✓ Kept ${keptCount}/${frames.length} useful frame(s): ${framesDir}`);
+  return framesDir;
+}
+
 async function transcribe(audioPath) {
   const baseName = path.basename(audioPath, path.extname(audioPath));
   const outputDir = path.dirname(audioPath);
