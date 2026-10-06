@@ -8,13 +8,16 @@ const execAsync = promisify(exec);
 
 const EXEC_OPTS = { encoding: 'utf-8', maxBuffer: 1024 * 1024 * 100 };
 
+// Claude model used for every CLI call in the pipeline.
+const CLAUDE_MODEL = 'claude-haiku-4-5-20251001';
+
 // Runs the claude CLI with a prompt, passed via a temp file + stdin redirect
 // (async child_process.exec doesn't support the `input` option execSync has).
 async function runClaude(prompt, extraArgs = '') {
   const tmpFile = path.join(os.tmpdir(), `claude-prompt-${crypto.randomUUID()}.txt`);
   fs.writeFileSync(tmpFile, prompt, 'utf-8');
   try {
-    const { stdout } = await execAsync(`claude -p ${extraArgs} < "${tmpFile}"`, EXEC_OPTS);
+    const { stdout } = await execAsync(`claude -p --model ${CLAUDE_MODEL} ${extraArgs} < "${tmpFile}"`, EXEC_OPTS);
     return stdout.trim();
   } finally {
     fs.unlinkSync(tmpFile);
