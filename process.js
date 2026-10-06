@@ -280,9 +280,17 @@ async function generateDocx(notesPath, framesDir) {
   console.log(`[docx] Inserting screenshots and generating DOCX...`);
 
   const notesContent = fs.readFileSync(notesPath, 'utf-8');
-  const frameFiles = fs.existsSync(framesDir)
+  const allFrameFiles = fs.existsSync(framesDir)
     ? fs.readdirSync(framesDir).filter(f => f.endsWith('.png')).sort()
     : [];
+
+  // Frames are sorted by time, so an evenly spaced sample covers the whole lecture
+  // instead of handing the placement step dozens of near-identical captions.
+  const PLACEMENT_SAMPLE_SIZE = 10;
+  const frameFiles = allFrameFiles.length <= PLACEMENT_SAMPLE_SIZE
+    ? allFrameFiles
+    : Array.from({ length: PLACEMENT_SAMPLE_SIZE }, (_, i) =>
+        allFrameFiles[Math.floor(i * allFrameFiles.length / PLACEMENT_SAMPLE_SIZE)]);
 
   if (frameFiles.length === 0) {
     console.log('No kept frames to insert; converting notes as-is.');
