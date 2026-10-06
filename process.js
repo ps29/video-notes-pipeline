@@ -254,6 +254,13 @@ ${notesContent}`;
   if (frameFiles.length > 0) {
     try {
       finalMarkdown = await runClaude(prompt);
+      let imageCount = (finalMarkdown.match(/!\[[^\]]*\]\([^)]+\)/g) || []).length;
+      if (imageCount === 0) {
+        console.log(`No image references inserted on first attempt (${frameFiles.length} frame(s) available); retrying once...`);
+        finalMarkdown = await runClaude(prompt);
+        imageCount = (finalMarkdown.match(/!\[[^\]]*\]\([^)]+\)/g) || []).length;
+      }
+      console.log(`Inserted ${imageCount} image reference(s) into notes.`);
     } catch (err) {
       console.error('Claude CLI failed to insert screenshots, converting notes as-is:', err.message);
     }
