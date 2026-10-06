@@ -84,9 +84,12 @@ async function mapWithConcurrency(items, limit, fn) {
 }
 
 async function filterFrames(framesDir) {
-  const frames = fs.readdirSync(framesDir).filter(f => f.endsWith('.png')).sort();
+  const allFrames = fs.readdirSync(framesDir).filter(f => f.endsWith('.png')).sort();
 
-  console.log(`[filter] Classifying ${frames.length} candidate frame(s) with Claude (${FRAME_CLASSIFY_CONCURRENCY} at a time)...`);
+  // Drop near-duplicates before paying for a Claude call on each frame.
+  const frames = await dedupeFrames(framesDir, allFrames);
+
+  console.log(`[filter] Classifying ${frames.length} unique candidate frame(s) with Claude (${FRAME_CLASSIFY_CONCURRENCY} at a time)...`);
 
   const keptFlags = await mapWithConcurrency(frames, FRAME_CLASSIFY_CONCURRENCY, async (frameFile) => {
     const framePath = path.join(framesDir, frameFile);
@@ -94,30 +97,71 @@ async function filterFrames(framesDir) {
 
 This is a frame extracted from a computer science lecture video. Decide whether it is worth keeping as a reference screenshot in study notes.
 
-Respond with exactly one word, USEFUL or DISCARD, and nothing else.
+Respond in exactly this format, and nothing else:
+Line 1: USEFUL or DISCARD
+Line 2: if USEFUL, a short caption (under 15 words) describing what the frame shows; otherwise leave it empty.
 - USEFUL: the frame shows a diagram, code snippet, chart, equation, slide text, or other reference-worthy visual content.
 - DISCARD: the frame is blank, a blurry transition, or just shows a presenter/talking head with no supporting visual.`;
 
     try {
       const output = await runClaude(prompt, `--add-dir "${framesDir}" --allowedTools Read`);
-      return /^USEFUL/i.test(output);
+      const [verdict, ...rest] = output.split('\n');
+      const useful = /^USEFUL/i.test(verdict.trim());
+      return { useful, caption: rest.join(' ').trim() };
     } catch (err) {
       console.error(`Frame classification failed for ${frameFile}:`, err.message);
-      return false;
+      return { useful: false, caption: '' };
     }
   });
 
-  let keptCount = 0;
   frames.forEach((frameFile, i) => {
-    if (keptFlags[i]) {
-      keptCount++;
-    } else {
-      fs.unlinkSync(path.join(framesDir, frameFile));
-    }
+    if (!keptFlags[i].useful) fs.unlinkSync(path.join(framesDir, frameFile));
   });
 
-  console.log(`✓ Kept ${keptCount}/${frames.length} useful frame(s): ${framesDir}`);
+  const keptFrames = frames.filter((_, i) => keptFlags[i].useful);
+
+  // Captions are saved next to the frames so the notes step can match each
+  // image to the section it illustrates. Only frames that survived dedupe are kept.
+  const captions = {};
+  for (const frameFile of keptFrames) {
+    if (fs.existsSync(path.join(framesDir, frameFile))) {
+      captions[frameFile] = keptFlags[frames.indexOf(frameFile)].caption;
+    }
+  }
+  fs.writeFileSync(path.join(framesDir, 'captions.json'), JSON.stringify(captions, null, 2), 'utf-8');
+
+  console.log(`✓ Kept ${keptFrames.length}/${frames.length} useful frame(s) after removing duplicates: ${framesDir}`);
   return framesDir;
+}
+
+// SSIM above this between a kept frame and the last kept frame means the same
+// slide/diagram is on screen (pen or hand movement only), so the frame is dropped.
+// Measured on a lecture video: same-slide neighbours scored ~0.84-0.96.
+const SSIM_DUPLICATE_THRESHOLD = 0.9;
+
+async function ssimBetween(fileA, fileB) {
+  const { stdout } = await execAsync(
+    `ffmpeg -hide_banner -i "${fileA}" -i "${fileB}" -lavfi ssim -f null - 2>&1`,
+    EXEC_OPTS
+  );
+  const match = stdout.match(/All:([0-9.]+)/);
+  return match ? parseFloat(match[1]) : 0;
+}
+
+// Deletes frames that duplicate the previously kept frame. Returns the file names that remain.
+async function dedupeFrames(framesDir, frameFiles) {
+  let lastKept = null;
+  const remaining = [];
+  for (const frameFile of frameFiles) {
+    const framePath = path.join(framesDir, frameFile);
+    if (lastKept && await ssimBetween(lastKept, framePath) >= SSIM_DUPLICATE_THRESHOLD) {
+      fs.unlinkSync(framePath);
+    } else {
+      lastKept = framePath;
+      remaining.push(frameFile);
+    }
+  }
+  return remaining;
 }
 
 async function transcribe(audioPath) {
@@ -245,10 +289,13 @@ async function generateDocx(notesPath, framesDir) {
   }
 
   const framesDirName = path.basename(framesDir);
-  const prompt = `Here are study notes in markdown, followed by a list of available screenshot filenames extracted from the source lecture video. Insert markdown image references (e.g. "![description](${framesDirName}/<filename>)") at the points in the notes where each screenshot is most relevant (e.g. a diagram next to the section explaining it, a code screenshot next to the code walkthrough). Not every screenshot needs to be used if none of them fit a section well, and don't force irrelevant placements. Output the full updated markdown with the image references inserted, and nothing else (no commentary).
+  const captionsPath = path.join(framesDir, 'captions.json');
+  const captions = fs.existsSync(captionsPath) ? JSON.parse(fs.readFileSync(captionsPath, 'utf-8')) : {};
 
-Available screenshot filenames (in the "${framesDirName}" folder, relative to this document):
-${frameFiles.map(f => `- ${f}`).join('\n')}
+  const prompt = `Here are study notes in markdown, followed by a list of available screenshots from the source lecture video, each with a caption describing what it shows. Insert markdown image references (e.g. "![caption](${framesDirName}/<filename>)") at the points in the notes where each screenshot is most relevant, matching the caption to the section it illustrates. Use each screenshot at most once. Not every screenshot needs to be used if none of them fit a section well, and don't force irrelevant placements. Output the full updated markdown with the image references inserted, and nothing else (no commentary).
+
+Available screenshots (in the "${framesDirName}" folder, relative to this document):
+${frameFiles.map(f => `- ${f}: ${captions[f] || '(no caption)'}`).join('\n')}
 
 Study notes:
 ${notesContent}`;
