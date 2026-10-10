@@ -8,9 +8,9 @@ const execAsync = promisify(exec);
 
 const EXEC_OPTS = { encoding: 'utf-8', maxBuffer: 1024 * 1024 * 100 };
 
-// Screenshot stages (frame extraction, Claude frame classification, image placement,
-// DOCX) are switched off for now: they cost many extra CLI calls. Set to true to re-enable.
-const ENABLE_SCREENSHOTS = false;
+// Screenshot stages (frame extraction, Claude frame classification, local-model frame
+// analysis, image placement, DOCX). They cost extra CLI calls; set to false to skip them.
+const ENABLE_SCREENSHOTS = true;
 
 // Claude model used for every CLI call in the pipeline.
 const CLAUDE_MODEL = 'claude-haiku-4-5-20251001';
@@ -259,6 +259,20 @@ Line 2: if USEFUL, a short caption (under 15 words) describing what the frame sh
   return framesDir;
 }
 
+// Describes the kept frames (and transcribes their on-screen text) with a local vision model
+// via frame_analyze.py. Optional: on any failure the pipeline continues with Claude's captions.
+async function analyzeFrames(framesDir) {
+  console.log(`[analyze] Describing kept frames with the local vision model...`);
+  try {
+    const venvPython = path.join(__dirname, '.venv', 'Scripts', 'python.exe');
+    await execAsync(`"${venvPython}" "${path.join(__dirname, 'frame_analyze.py')}" "${framesDir}"`, EXEC_OPTS);
+    console.log(`✓ Frame descriptions saved: ${path.join(framesDir, 'descriptions.json')}`);
+  } catch (err) {
+    console.warn(`Local frame analysis skipped (run setup-llama.ps1?): ${(err.stderr || err.message).toString().trim().split('\n').pop()}`);
+  }
+  return framesDir;
+}
+
 // SSIM above this between a kept frame and the last kept frame means the same
 // slide/diagram is on screen (pen or hand movement only), so the frame is dropped.
 // Measured on a lecture video: same-slide neighbours scored ~0.84-0.96.
@@ -447,6 +461,7 @@ async function generateDocx(notesPath, framesDir, segmentsPath) {
   const captions = readJson(path.join(framesDir, 'captions.json'), {});
   const frameTimes = readJson(path.join(framesDir, 'frames.json'), {});
   const segments = readJson(segmentsPath, []);
+  const descriptions = readJson(path.join(framesDir, 'descriptions.json'), {});
 
   // captions.json only lists frames that survived dedupe and classification.
   const keptFiles = Object.keys(captions).filter(f => fs.existsSync(path.join(framesDir, f))).sort();
@@ -458,7 +473,11 @@ async function generateDocx(notesPath, framesDir, segmentsPath) {
       .map(s => s.text)
       .join(' ')
       .slice(0, 800);
-    return { file, time: frameTimes[file], caption: captions[file] || '(no caption)', speech };
+    const local = descriptions[file] || {};
+    return {
+      file, time: frameTimes[file], caption: captions[file] || '(no caption)', speech,
+      description: local.description || '', onScreen: (local.text || '').slice(0, 300),
+    };
   });
 
   if (chosen.length === 0) {
@@ -470,7 +489,7 @@ async function generateDocx(notesPath, framesDir, segmentsPath) {
   const prompt = `Here are study notes in markdown, followed by screenshots from the source lecture video in time order. For each screenshot you get its timestamp, a caption, and what the lecturer was saying around that time. Insert a markdown image reference (e.g. "![caption](${framesDirName}/<filename>)") at the point in the notes that covers what the lecturer was saying at that moment. Use each screenshot exactly once, and put each one under a different section when possible. Output the full updated markdown with the image references inserted, and nothing else (no commentary).
 
 Screenshots (in the "${framesDirName}" folder, relative to this document):
-${chosen.map(c => `- ${c.file} [${formatTime(c.time)}]: ${c.caption}\n  Lecturer was saying: "${c.speech}"`).join('\n')}
+${chosen.map(c => `- ${c.file} [${formatTime(c.time)}]: ${c.caption}${c.description ? `\n  Description: ${c.description}` : ''}${c.onScreen ? `\n  On-screen text: ${c.onScreen}` : ''}\n  Lecturer was saying: "${c.speech}"`).join('\n')}
 
 Study notes:
 ${notesContent}`;
@@ -544,6 +563,7 @@ async function processSingleVideo(videoPath) {
     const framesJob = ENABLE_SCREENSHOTS
       // Frame extraction/filtering only needs the source video; it runs alongside the transcript path.
       ? audioLimit(() => extractFrames(videoPath)).then(dir => { framesDir = dir; return filterFrames(dir); })
+          .then(dir => whisperLimit(() => analyzeFrames(dir)))
       : null;
 
     let transcriptPath;

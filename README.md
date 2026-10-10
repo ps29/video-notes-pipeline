@@ -43,6 +43,16 @@ You can use this **instead of** building whisper.cpp. It runs on the CPU, needs 
 
 To force a backend, set `WHISPER_BACKEND` to `whisper.cpp` or `faster-whisper`. To force a specific whisper.cpp model, set `WHISPER_MODEL` to the path of a `ggml-*.bin` file.
 
+## Local frame analysis (optional)
+
+With screenshots enabled, kept frames are also described by a local vision model via `frame_analyze.py`. It writes `descriptions.json` (a description plus on-screen text per frame) into the `-frames` folder, and the image-placement prompt uses it. Claude still classifies and captions the frames.
+
+**Preferred: Lemonade Server** (AMD, good fit for Ryzen AI). Install it, start it, and pull a vision model: `lemonade pull Qwen3-VL-8B-Instruct-GGUF`. The script uses it automatically when it answers at `LEMONADE_URL` (default `http://localhost:13305/api/v1`). Pick another model with `LEMONADE_MODEL`.
+
+**Fallback: llama.cpp.** If Lemonade isn't running, the script launches `llama-server` itself (Qwen2.5-VL-3B, Vulkan GPU). Run `.\setup-whisper.ps1` first (it installs the build tools), then `.\setup-llama.ps1`. Override with `VLM_MODEL` / `VLM_MMPROJ` (paths) or `LLAMA_SERVER`.
+
+If neither is available, the stage logs a warning and the pipeline carries on with Claude's captions. You can also run it by hand on a frames folder, a video, or a folder of videos: `python frame_analyze.py <path>`.
+
 ## Usage
 
 ```bash
