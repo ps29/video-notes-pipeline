@@ -54,6 +54,16 @@ With screenshots enabled, kept frames are also described by a local vision model
 
 If neither is available, the stage logs a warning and the pipeline carries on with Claude's captions. You can also run it by hand on a frames folder, a video, or a folder of videos: `python frame_analyze.py <path>`.
 
+### How frames are selected and described
+
+1. **Candidates.** ffmpeg keeps a frame whenever the scene-change score exceeds `SCENE_CHANGE_THRESHOLD` (0.02). That is low on purpose: slide and screen-capture lectures change by text appearing, not by cuts, so movie-style thresholds barely fire. Each frame's timestamp is saved to `frames.json`.
+2. **Deduplication.** `dedupeFrames` compares each frame with the previous kept one using ffmpeg's SSIM and drops it at or above `SSIM_DUPLICATE_THRESHOLD` (0.9). Pen or cursor movement on the same slide scores about 0.84–0.96, so this removes most repeats. Lower the threshold to keep fewer frames, raise it to keep more build-up steps.
+3. **Classification.** Claude marks each remaining frame `USEFUL` or `DISCARD` (blank frames, transitions, a talking head with no visual) and writes a short caption. Discarded frames are deleted.
+4. **Local description.** `frame_analyze.py` sends each kept frame to a local vision model and stores a description plus the on-screen text in `descriptions.json`. This gives the placement step much better context than a 15-word caption, and it costs no Claude tokens.
+5. **Placement.** The lecture is split into time windows, each window contributes its last kept frame (the most complete version of a diagram that builds up), and Claude inserts each one where the lecturer was talking about it.
+
+**Model choice (Lemonade).** The default is `Qwen3-VL-8B-Instruct-GGUF`, run by Lemonade Server on the GPU (tested on a Radeon 8060S). On a 4-frame test it took about 4 s per frame once loaded, and it read slide text more completely than Qwen2.5-VL-3B. The 4B model was no faster in testing (about 3.2 s per frame against 4 s) and its descriptions were vaguer. Sending 4 frames as a 2×2 grid, or sending requests in parallel, gave no speedup locally. Change the model with `LEMONADE_MODEL`.
+
 ## Usage
 
 ```bash
