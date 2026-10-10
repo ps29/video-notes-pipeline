@@ -13,7 +13,7 @@ const EXEC_OPTS = { encoding: 'utf-8', maxBuffer: 1024 * 1024 * 100 };
 const ENABLE_SCREENSHOTS = true;
 
 // Claude model used for every CLI call in the pipeline.
-const CLAUDE_MODEL = 'claude-haiku-4-5-20251001';
+const CLAUDE_MODEL = 'claude-haiku-5-5';
 
 // Runs the claude CLI with a prompt, passed via a temp file + stdin redirect
 // (async child_process.exec doesn't support the `input` option execSync has).

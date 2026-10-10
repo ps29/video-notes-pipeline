@@ -1,11 +1,12 @@
 # Video → Study Notes Pipeline
 
-A Node.js pipeline that turns lecture videos into self-contained markdown study notes. For each video it gets a transcript (from an existing `.srt` subtitle file, or by transcribing the audio locally with Whisper) and sends it to the Claude CLI to generate exam-oriented notes.
+A Node.js pipeline that turns lecture videos into self-contained markdown study notes. For each video it gets a transcript (from an existing `.srt` subtitle file, or by transcribing the audio locally with Whisper) and sends it to the Claude CLI to generate exam-oriented notes. With screenshots enabled (the default) it also picks the useful lecture frames, describes them with a local vision model, and produces a DOCX with the screenshots placed in the notes.
 
 ## Prerequisites
 
 - **Node.js** (v16+)
-- **ffmpeg** on PATH (only needed for videos that have no subtitle file)
+- **ffmpeg** on PATH (audio extraction, and frame extraction for screenshots)
+- **pandoc** on PATH (DOCX output when screenshots are enabled)
 - **Claude Code CLI** (`claude`) installed and logged in
 - **A Whisper backend** (only needed for videos without subtitles) — see below
 - **Python 3** — `transcribe.py` is launched through `.venv\Scripts\python.exe`
@@ -89,6 +90,8 @@ When a subtitle file exists it is used as the transcript: audio extraction and W
 Per video, in the same folder as the video:
 
 - **`<number>-<topic-title>.md`** — the study notes, followed by the original transcript under an "Original Transcript" heading. The leading number comes from the video's file name, which keeps note names unique and in lecture order. The rest comes from the title Claude writes.
+- **`<same-name>.docx`** — the notes with screenshots inserted (screenshots enabled only).
+- `<name>-frames\` — the kept screenshots plus `frames.json` (timestamps), `captions.json` and `descriptions.json` (local vision-model output).
 - `<name>.wav` — extracted audio, only for videos transcribed with Whisper (safe to delete).
 - `<name>.segments.json` — timed transcript segments (safe to delete).
 
@@ -96,9 +99,14 @@ Per video, in the same folder as the video:
 
 1. **Transcript** — an `.srt` file if there is one; otherwise ffmpeg extracts 16 kHz mono audio and Whisper transcribes it.
 2. **Transcript correction** — for Whisper transcripts only, Claude fixes mis-transcribed technical terms.
-3. **Study notes** — Claude generates detailed, self-contained, exam-oriented notes: explanations, definitions, worked examples, an exam-prep section with likely questions and model answers. Diagrams the presenter shows are described in words, since there are no screenshots.
+3. **Study notes** — Claude generates detailed, self-contained, exam-oriented notes: explanations, definitions, worked examples, an exam-prep section with likely questions and model answers. Diagrams the presenter shows are described in words.
+4. **Screenshots** (when `ENABLE_SCREENSHOTS` is on, runs alongside steps 1–3):
+   - ffmpeg extracts candidate frames on scene changes, and near-duplicates are removed with SSIM.
+   - Claude classifies each remaining frame as useful or discard and writes a short caption.
+   - A local vision model (Lemonade, or llama.cpp as a fallback) describes each kept frame and transcribes its on-screen text — see "Local frame analysis" above.
+   - Claude inserts one screenshot per time window into the notes, using the descriptions and what the lecturer was saying; pandoc then writes the DOCX.
 
-Screenshot extraction, per-frame classification and DOCX output still exist in `process.js` but are switched off (`ENABLE_SCREENSHOTS = false`) because they cost many extra Claude calls.
+Screenshots cost extra Claude calls (one per frame, plus one to place them), so they are the largest share of the token use. Set `ENABLE_SCREENSHOTS = false` to skip them.
 
 ## Configuration
 
@@ -108,9 +116,9 @@ At the top of `process.js`:
 |---|---|
 | `USE_SUBTITLES` | Use `.srt` files when found (default `true`) |
 | `SKIP_FIX_FOR_SUBTITLES` | Skip the Claude transcript-fix call for subtitles (default `true`) |
-| `ENABLE_SCREENSHOTS` | Frame extraction, classification and DOCX (default `false`) |
-| `AUDIO_CONCURRENCY`, `WHISPER_CONCURRENCY`, `CLAUDE_CONCURRENCY` | Parallel jobs per stage |
-| `CLAUDE_MODEL` | Model used for every Claude CLI call |
+| `ENABLE_SCREENSHOTS` | Frame extraction, classification, local frame analysis and DOCX (default `true`) |
+| `AUDIO_CONCURRENCY`, `WHISPER_CONCURRENCY`, `CLAUDE_CONCURRENCY` | Parallel jobs per stage (the local vision step shares the Whisper limit, since both use the GPU) |
+| `CLAUDE_MODEL` | Model used for every Claude CLI call (default `claude-haiku-5-5`) |
 
 The note-generation prompt is `generateNotes()` in `process.js`; edit it to change the structure or style of the notes.
 
