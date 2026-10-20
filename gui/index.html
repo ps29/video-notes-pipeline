@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'">
+  <title>Video Notes</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Video Notes</div>
+    <input id="input-path" type="text" placeholder="Video file or folder of videos" spellcheck="false">
+    <button id="pick-file">File…</button>
+    <button id="pick-folder">Folder…</button>
+    <button id="start" class="primary">Start</button>
+    <button id="stop" class="danger" disabled>Stop</button>
+    <div class="run-status">
+      <span id="run-state" class="pill idle">Idle</span>
+      <span id="run-elapsed">0s</span>
+    </div>
+  </header>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <div class="batch-progress"><div id="batch-bar"></div></div>
+  <div class="batch-summary" id="batch-summary">No run yet</div>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="monitor">Monitor</button>
+    <button class="tab" data-tab="settings">Settings</button>
+    <div class="spacer"></div>
+    <div id="checks" class="checks"></div>
+    <button id="choose-root" class="link" title="Folder containing process.js, .venv and tools/">Pipeline folder</button>
+  </nav>
+
+  <main>
+    <section id="tab-monitor" class="tab-panel">
+      <div class="board-wrap">
+        <table class="board">
+          <thead>
+            <tr><th>Video</th><th>Stages</th><th>Status</th><th>Time</th><th>Actions</th></tr>
+          </thead>
+          <tbody id="board-body">
+            <tr class="empty"><td colspan="5">Choose a video or folder and press Start.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="log-panel">
+        <div class="log-toolbar">
+          <strong>Log</strong>
+          <select id="log-video"><option value="">All videos</option></select>
+          <label><input type="checkbox" class="lvl" value="debug" checked> debug</label>
+          <label><input type="checkbox" class="lvl" value="info" checked> info</label>
+          <label><input type="checkbox" class="lvl" value="warn" checked> warn</label>
+          <label><input type="checkbox" class="lvl" value="error" checked> error</label>
+          <input id="log-search" type="search" placeholder="Search log" spellcheck="false">
+          <div class="spacer"></div>
+          <label><input type="checkbox" id="autoscroll" checked> Auto-scroll</label>
+          <button id="log-clear">Clear</button>
+          <button id="log-open">Log files</button>
+        </div>
+        <div id="log" class="log"></div>
+      </div>
+    </section>
+
+    <section id="tab-settings" class="tab-panel hidden">
+      <form id="settings-form" class="settings"></form>
+      <div class="settings-actions">
+        <button id="settings-save" class="primary">Save</button>
+        <button id="settings-defaults">Restore defaults</button>
+        <span id="settings-msg"></span>
+      </div>
+    </section>
+  </main>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

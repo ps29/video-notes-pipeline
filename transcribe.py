@@ -39,11 +39,11 @@ def transcribe_whisper_cpp(audio_path):
         out_base = os.path.join(tmp, "out")
         result = subprocess.run(
             [WHISPER_CLI, "-m", MODEL, "-f", audio_path, "-l", "en",
-             "-oj", "-of", out_base, "-np"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+             "-oj", "-of", out_base, "-pp"],
+            # stderr passes through so callers (the GUI log) see whisper.cpp's progress
+            stdout=subprocess.DEVNULL,
         )
         if result.returncode != 0:
-            print(result.stderr, file=sys.stderr)
             sys.exit(result.returncode)
         with open(out_base + ".json", encoding="utf-8") as f:
             data = json.load(f)

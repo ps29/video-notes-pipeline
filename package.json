@@ -1,10 +1,15 @@
 {
   "name": "video-notes-pipeline",
+  "productName": "Video Notes",
   "version": "1.0.0",
   "description": "Extract text from video, fix transcription errors, and generate study notes",
-  "main": "process.js",
+  "main": "gui/main.js",
   "scripts": {
-    "start": "node process.js"
+    "start": "node process.js",
+    "gui": "electron .",
+    "dist": "electron-builder --win nsis portable",
+    "dist:installer": "electron-builder --win nsis",
+    "dist:portable": "electron-builder --win portable"
   },
   "keywords": [
     "video",
@@ -13,6 +18,39 @@
     "claude",
     "study-notes"
   ],
-  "author": "",
-  "license": "MIT"
+  "author": "Pravesh Shrestha",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "44.9.1",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "com.praveshshrestha.videonotes",
+    "productName": "Video Notes",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "gui/**",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Video Notes",
+      "artifactName": "VideoNotes-Setup-${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "VideoNotes-Portable-${version}.${ext}"
+    }
+  }
 }

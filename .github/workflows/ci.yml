@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'feat/**']
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax check (JavaScript)
+        shell: bash
+        run: |
+          for f in process.js gui/*.js; do node --check "$f"; done
+
+      - name: Syntax check (Python)
+        run: python -I -m py_compile transcribe.py frame_analyze.py
+
+      # Forks process.js the way the GUI does and checks it reports over IPC and ends cleanly
+      # (no ffmpeg/Claude needed: the input path does not exist).
+      - name: Worker smoke test
+        shell: bash
+        run: |
+          node -e "
+            const { fork } = require('child_process');
+            const c = fork('process.js', [], { env: { ...process.env, VIDEO_NOTES_WORKER: '1' } });
+            const seen = [];
+            c.on('message', m => {
+              seen.push(m.type);
+              if (m.type === 'ready') c.send({ cmd: 'start', input: 'does-not-exist' });
+            });
+            c.on('exit', code => {
+              console.log('messages:', seen.join(' '), '| exit', code);
+              const ok = code === 0 && seen[0] === 'ready' && seen.includes('log') && seen.at(-1) === 'end';
+              process.exit(ok ? 0 : 1);
+            });
+          "
+
+      - name: Module exports
+        run: node -e "const m = require('./process.js'); for (const k of ['run','resetVideo','DEFAULT_SETTINGS','VIDEO_EXTENSIONS']) if (!(k in m)) throw new Error('missing export ' + k); console.log('exports ok')"
+
+  build:
+    name: Build Windows installer
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Tag builds take their version from the tag (v1.2.3 -> 1.2.3).
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: npm version --no-git-tag-version "${GITHUB_REF_NAME#v}"
+
+      - name: Build installer and portable exe
+        run: npx electron-builder --win nsis portable --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: video-notes-windows
+          path: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest.yml
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: video-notes-windows
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.exe \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Video Notes $GITHUB_REF_NAME" \
+            --generate-notes
