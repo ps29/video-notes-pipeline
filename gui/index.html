@@ -67,14 +67,25 @@
 
     <section id="tab-deps" class="tab-panel hidden">
       <div class="deps-scroll">
+        <div id="deps-welcome" class="welcome hidden">
+          <h2>Welcome to Video Notes</h2>
+          <p>
+            Video Notes turns lecture videos into study notes using a few other programs: ffmpeg, an AI model
+            (the Claude CLI by default, or an API or a model on this PC), and, for videos without subtitles,
+            Python with Whisper speech-to-text. Below is what was found on this PC. Set up what's missing now,
+            or later from this <strong>Dependencies</strong> tab.
+          </p>
+          <button id="deps-welcome-close" class="small">Got it</button>
+        </div>
         <div class="deps-intro">
           <p>
-            Video Notes doesn't install anything for you. Each item below says what it's for, whether it was found,
-            and how to install it. Run the commands yourself (or follow the links), then press <strong>Check again</strong>.
-            The same check runs in a terminal with <code>npm run check</code>.
+            Nothing is installed unless you press <strong>Install</strong>: it first shows the exact command, then runs it
+            in a PowerShell window you can watch, where any license or administrator prompts appear. You can also copy the
+            commands and run them yourself. The list re-checks when a setup window closes; <code>npm run check</code> runs the same check in a terminal.
           </p>
           <div class="deps-actions">
             <button id="deps-check" class="primary">Check again</button>
+            <button id="deps-install-missing" class="hidden" title="Installs every missing required tool that has a quick installer, in one window">Install missing</button>
             <button id="deps-test-gpu" title="Transcribes an 11-second sample with whisper.cpp and reports whether the GPU was used">Test GPU</button>
             <button id="deps-test-llm" title="Sends one short prompt to the LLM provider set in Settings (a billed request for paid APIs)">Test LLM</button>
             <button id="deps-terminal" title="Opens PowerShell in the pipeline folder, where the install commands should be run">Open PowerShell here</button>

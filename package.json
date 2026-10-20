@@ -9,9 +9,9 @@
     "check": "node deps-check.js",
     "test": "node --test \"test/**/*.test.js\"",
     "gui": "electron .",
-    "dist": "electron-builder --win nsis portable",
-    "dist:installer": "electron-builder --win nsis",
-    "dist:portable": "electron-builder --win portable"
+    "dist": "electron-builder --config electron-builder.config.js --win nsis portable",
+    "dist:installer": "electron-builder --config electron-builder.config.js --win nsis",
+    "dist:portable": "electron-builder --config electron-builder.config.js --win portable"
   },
   "keywords": [
     "video",
@@ -25,35 +25,6 @@
   "devDependencies": {
     "electron": "44.9.1",
     "electron-builder": "26.15.3"
-  },
-  "build": {
-    "appId": "com.praveshshrestha.videonotes",
-    "productName": "Video Notes",
-    "directories": {
-      "output": "dist"
-    },
-    "files": [
-      "gui/**",
-      "package.json"
-    ],
-    "win": {
-      "target": [
-        "nsis",
-        "portable"
-      ]
-    },
-    "nsis": {
-      "oneClick": false,
-      "perMachine": false,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true,
-      "shortcutName": "Video Notes",
-      "artifactName": "VideoNotes-Setup-${version}.${ext}"
-    },
-    "portable": {
-      "artifactName": "VideoNotes-Portable-${version}.${ext}"
-    }
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.135.0"

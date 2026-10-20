@@ -63,7 +63,18 @@ async function pythonJson(script, env = {}) {
 
 // ---------- individual checks ----------
 // Each returns { id, name, purpose, neededFor, need, status, version, path, detail, install }.
-// status: ok | missing | warn | off. install: [{ label, command?, url?, note? }].
+// status: ok | missing | warn | off. install: [{ label, command?, url?, note?, action? }].
+//
+// `action` makes an option runnable from the app's setup assistant (gui/main.js runs it in a
+// visible PowerShell window in the pipeline folder, after the user confirms):
+//   { steps: [step...], admin?: true, heavy?: true }
+//   step: { winget: '<package id>', exe?: '<skip if this command exists>' }
+//       | { run: '<PowerShell command>' } | { script: '<.ps1 in the pipeline folder>' }
+// `command` is the same thing as text, for copying and for the confirmation dialog.
+const winget = (id, exe) => ({
+  command: `winget install --id ${id} -e`,
+  action: { steps: [{ winget: id, ...(exe ? { exe } : {}) }] },
+});
 
 async function checkTool({ id, name, exe, versionArgs, parseVersion, purpose, need, install }) {
   const found = await locate(exe);
@@ -80,7 +91,7 @@ const checkFfmpeg = () => checkTool({
   purpose: 'Extracts audio for Whisper and candidate frames for screenshots.',
   need: 'always',
   install: [
-    { label: 'winget', command: 'winget install --id Gyan.FFmpeg -e' },
+    { label: 'winget', ...winget('Gyan.FFmpeg', 'ffmpeg') },
     { label: 'Download', url: 'https://www.gyan.dev/ffmpeg/builds/', note: 'Unzip and add its bin folder to PATH.' },
   ],
 });
@@ -91,7 +102,7 @@ const checkPandoc = settings => checkTool({
   purpose: 'Converts the notes with screenshots into the .docx file.',
   need: 'screenshots',
   install: [
-    { label: 'winget', command: 'winget install --id JohnMacFarlane.Pandoc -e' },
+    { label: 'winget', ...winget('JohnMacFarlane.Pandoc', 'pandoc') },
     { label: 'Download', url: 'https://pandoc.org/installing.html' },
   ],
 }).then(r => (settings.ENABLE_SCREENSHOTS || r.status === 'ok' ? r : { ...r, status: 'off', detail: 'Not needed: screenshots are turned off in Settings.' }));
@@ -105,7 +116,8 @@ const checkClaude = settings => {
     purpose: 'Fixes transcripts, writes the notes, and classifies and places screenshots (when the LLM provider is "Claude CLI").',
     need: inUse ? 'always' : 'optional',
     install: [
-      { label: 'PowerShell', command: 'irm https://claude.ai/install.ps1 | iex', note: 'Then run "claude" once and log in. Use "Test LLM" here to confirm.' },
+      { label: 'winget', ...winget('Anthropic.ClaudeCode', 'claude'), note: 'Then log in (next row). Use "Test LLM" here to confirm.' },
+      { label: 'Log in', command: 'claude', action: { steps: [{ run: 'claude' }] }, note: 'Starts Claude Code in the window; follow the login prompt (or type /login), then /exit.' },
       { label: 'Docs', url: 'https://code.claude.com/docs/en/setup' },
     ],
   }).then(r => (inUse || r.status === 'ok' ? r : { ...r, status: 'off', detail: `Not needed: the LLM provider is ${settings.LLM_PROVIDER}.` }));
@@ -121,12 +133,14 @@ const LLM_INSTALL = {
   openai: [{ label: 'API key', url: 'https://platform.openai.com/api-keys', note: 'Paste it in Settings → LLM provider (or set OPENAI_API_KEY).' }],
   openrouter: [{ label: 'API key', url: 'https://openrouter.ai/keys', note: 'Paste it in Settings → LLM provider (or set OPENROUTER_API_KEY).' }],
   ollama: [
-    { label: 'Install', url: 'https://ollama.com/download' },
+    { label: 'winget', ...winget('Ollama.Ollama', 'ollama') },
+    { label: 'Download', url: 'https://ollama.com/download' },
     { label: 'Get a model', command: 'ollama pull <model>', note: 'Pick a model at ollama.com/library. Frame classification needs one that reads images (ollama.com/search?c=vision); set it as the vision model.' },
   ],
   lmstudio: [
-    { label: 'Install', url: 'https://lmstudio.ai/download' },
-    { label: 'Start server', command: 'lms server start', note: 'Load a model with a context length of 32k or more (lms load <model> --context-length 32768). If "Require authentication" is on, add LM Studio\'s API token in Settings.' },
+    { label: 'winget', ...winget('ElementLabs.LMStudio') },
+    { label: 'Download', url: 'https://lmstudio.ai/download' },
+    { label: 'Start server', command: 'lms server start', action: { steps: [{ run: '& "$env:USERPROFILE\\.lmstudio\\bin\\lms.exe" server start' }] }, note: 'Load a model with a context length of 32k or more (lms load <model> --context-length 32768). If "Require authentication" is on, add LM Studio\'s API token in Settings.' },
     { label: 'Auth docs', url: 'https://lmstudio.ai/docs/developer/core/authentication' },
   ],
   lemonade: [{ label: 'Install', url: 'https://lemonade-server.ai/', note: 'Start Lemonade and load a model, then pick it in Settings → LLM provider.' }],
@@ -139,10 +153,18 @@ async function checkLlm(settings) {
   const { createLlm, PROVIDERS } = require('./llm');
   const llm = createLlm(settings);
   const { config } = llm;
+  const pulls = config.protocol === 'ollama' ? [...new Set([config.model, config.visionModel].filter(Boolean))] : [];
   const base = {
     id: 'llm', name: `LLM: ${config.label}`, need: 'always', neededFor: NEED.always,
     purpose: 'Fixes transcripts, writes the notes, and classifies and places screenshots. Choose the provider in Settings → LLM provider.',
-    install: LLM_INSTALL[config.id] || [],
+    install: [
+      ...(LLM_INSTALL[config.id] || []),
+      ...(pulls.length ? [{
+        label: 'Pull configured model', command: pulls.map(m => `ollama pull ${m}`).join('; '),
+        action: { steps: pulls.map(m => ({ run: `ollama pull ${m}` })) },
+        note: 'Downloads the model(s) set in Settings into Ollama.',
+      }] : []),
+    ],
   };
   if (config.protocol === 'claude-cli') {
     return { ...base, status: 'ok', version: config.model, detail: 'Uses the Claude CLI (checked separately). Use "Test LLM" to confirm you are logged in.' };
@@ -177,7 +199,11 @@ async function checkPython() {
     id: 'python', name: 'Python (.venv)', need: 'noSubtitles', neededFor: `${NEED.noSubtitles}; vision step`,
     purpose: 'Runs transcribe.py (Whisper) and frame_analyze.py (vision). Expected at .venv\\Scripts\\python.exe in the pipeline folder.',
     install: [
-      { label: 'uv (recommended)', command: 'uv sync', note: 'Run in the pipeline folder. Uses pyproject.toml/uv.lock and fetches Python 3.13 itself.' },
+      {
+        label: 'uv (recommended)', command: 'winget install --id astral-sh.uv -e; uv sync',
+        action: { steps: [{ winget: 'astral-sh.uv', exe: 'uv' }, { run: 'uv sync' }] },
+        note: 'Installs uv if needed, then creates .venv in the pipeline folder from pyproject.toml/uv.lock (uv fetches Python 3.13 itself, about 300 MB with faster-whisper).',
+      },
       { label: 'Python + venv', command: 'winget install --id Python.Python.3.13 -e; py -3.13 -m venv .venv', note: 'Run in the pipeline folder.' },
       { label: 'Get uv', url: 'https://docs.astral.sh/uv/getting-started/installation/' },
     ],
@@ -206,7 +232,7 @@ async function checkWhisper(settings) {
     id: 'whisper', name: 'Whisper (transcription)', need: 'noSubtitles', neededFor: NEED.noSubtitles,
     purpose: 'Transcribes the audio. whisper.cpp on the GPU (Vulkan) is preferred; faster-whisper on the CPU is the fallback.',
     install: [
-      { label: 'whisper.cpp (GPU)', command: '.\\setup-whisper.ps1', note: 'Run in PowerShell in the pipeline folder. Installs build tools (~6 GB) and builds whisper.cpp. Add -Model <name> to pick a model (see Models below).' },
+      { label: 'whisper.cpp (GPU)', command: '.\\setup-whisper.ps1', action: { steps: [{ script: 'setup-whisper.ps1' }], admin: true, heavy: true }, note: 'Run in PowerShell in the pipeline folder. Installs build tools (~6 GB) and builds whisper.cpp. Add -Model <name> to pick a model (see Models below).' },
       { label: 'faster-whisper (CPU)', command: '.\\.venv\\Scripts\\python.exe -m pip install faster-whisper', note: 'No build needed, but slower.' },
     ],
   };
@@ -249,7 +275,7 @@ async function checkVision(settings) {
     purpose: 'Describes each kept screenshot and reads its on-screen text, which helps place images. Without it, the pipeline uses Claude\'s short captions.',
     install: [
       { label: 'Lemonade Server', url: 'https://lemonade-server.ai/', note: 'Start it, then load the vision model it lists. The pipeline uses it automatically when it is running.' },
-      { label: 'llama.cpp', command: '.\\setup-llama.ps1', note: 'Run in PowerShell in the pipeline folder. Builds llama-server and downloads Qwen2.5-VL-3B (~3 GB).' },
+      { label: 'llama.cpp', command: '.\\setup-llama.ps1', action: { steps: [{ script: 'setup-llama.ps1' }], admin: true, heavy: true }, note: 'Run in PowerShell in the pipeline folder. Builds llama-server and downloads Qwen2.5-VL-3B (~3 GB).' },
     ],
   };
   if (!settings.ENABLE_SCREENSHOTS) return { ...base, status: 'off', detail: 'Not needed: screenshots are turned off in Settings.' };
