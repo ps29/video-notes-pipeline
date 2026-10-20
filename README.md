@@ -66,12 +66,48 @@ If neither is available, the stage logs a warning and the pipeline carries on wi
 
 ## Usage
 
+### Desktop app
+
+```bash
+npm install     # once: installs Electron and electron-builder
+npm run gui     # opens the Video Notes window
+```
+
+Pick a video or folder (or drag one onto the window) and press **Start**. The window shows:
+
+- **Stage board**: one row per video with a chip for each stage (srt, audio, whisper, frames, filter, vision, fix, notes, docx). The chips go dashed while a stage waits for a slot (for example "waiting for GPU"), blue while it runs, green when done, red when it fails, and struck through when skipped. The status column shows live progress such as `whisper 35%`, `filter 12/40` and `vision 3/18`. Buttons open the notes, the DOCX and the frames folder. **Reset** clears a finished video's entry in `.video-notes-state.json` so the next run processes it again.
+- **Log monitor**: every pipeline line, tagged with its video. It includes the live output of whisper.cpp and the vision model (the `debug` level). You can filter by video, level or text. Each run is also written to `logs\run-<time>.log`.
+- **Stop**: kills the run and every process it started (ffmpeg, Python, whisper-cli, claude). Finished steps are kept, so pressing Start again resumes.
+- **Settings tab**: edits the settings listed under [Configuration](#configuration) and saves them to `settings.json`, which `node process.js` reads too.
+- **Pre-flight badges**: show whether `ffmpeg`, `pandoc`, `claude` and `.venv` were found.
+
+#### Installer and portable exe
+
+```bash
+npm run dist              # both, into dist\
+npm run dist:installer    # dist\VideoNotes-Setup-<version>.exe
+npm run dist:portable     # dist\VideoNotes-Portable-<version>.exe
+```
+
+The app contains only the GUI. The pipeline still runs from this folder, using `process.js`, the Python helpers, `.venv` and `tools\`. That keeps the exe small and lets pipeline edits take effect without a rebuild. On first launch, an installed app asks for this folder ("Pipeline folder") and remembers your choice. A portable exe placed in this folder finds it automatically. The prerequisites above are still needed, and the builds are unsigned, so Windows SmartScreen will warn on first run.
+
+#### CI/CD
+
+`.github/workflows/ci.yml` runs on GitHub-hosted Windows runners for pushes to `main` and `feat/**`, and for pull requests:
+
+- **Check**: syntax checks, plus a smoke test that forks `process.js` the way the app does.
+- **Build**: the installer and portable exe, downloadable from the run's artifacts.
+
+Pushing a tag such as `v1.1.0` also publishes both exes as a GitHub release, versioned from the tag.
+
+### Command line
+
 ```bash
 node process.js path\to\video.mp4          # one video
 node process.js C:\path\to\Videos          # a folder, including all subfolders
 ```
 
-Supported formats: `.mp4`, `.mkv`, `.avi`, `.mov`, `.flv`, `.webm`, `.m4v`
+Supported formats: `.mp4`, `.mkv`, `.avi`, `.mov`, `.flv`, `.webm`, `.m4v`, `.ts`, `.mts`, `.m2ts` (add others with the `VIDEO_EXTS` env var, e.g. `VIDEO_EXTS=.vob,.3gp`)
 
 ### Folders and subfolders
 
@@ -93,13 +129,13 @@ When a subtitle file exists it is used as the transcript: audio extraction and W
 - Finished steps are skipped on a rerun (existing audio, transcript, and finished notes), so after a failure or an interruption just run the same command again.
 - A `.video-notes-state.json` file in each video folder records finished videos. If you replace a video file, its entry is invalidated automatically.
 - A failure in one video does not stop the batch.
-- With several videos, stages overlap: audio extraction (3 at a time), Whisper (1 at a time — it uses the GPU) and the Claude steps (2 at a time). These limits are constants at the top of `process.js`.
+- With several videos, stages overlap: audio extraction (3 at a time), Whisper (1 at a time — it uses the GPU) and the Claude steps (4 at a time). These limits are settings (see [Configuration](#configuration)).
 
 ## Output
 
 Per video, in the same folder as the video:
 
-- **`<number>-<topic-title>.md`** — the study notes, followed by the original transcript under an "Original Transcript" heading. The leading number comes from the video's file name, which keeps note names unique and in lecture order. The rest comes from the title Claude writes.
+- **`<number>-<topic-title>.md`** — the study notes, followed by the original transcript under an "Original Transcript" heading. The leading number is zero-padded (`02-`, `10-`) and comes from the video's file name, or from the video's position in its folder if the name has no number; the `.docx` uses the same name. This keeps note names unique and in lecture order. The rest comes from the title Claude writes.
 - **`<same-name>.docx`** — the notes with screenshots inserted (screenshots enabled only).
 - `<name>-frames\` — the kept screenshots plus `frames.json` (timestamps), `captions.json` and `descriptions.json` (local vision-model output).
 - `<name>.wav` — extracted audio, only for videos transcribed with Whisper (safe to delete).
@@ -116,18 +152,25 @@ Per video, in the same folder as the video:
    - A local vision model (Lemonade, or llama.cpp as a fallback) describes each kept frame and transcribes its on-screen text — see "Local frame analysis" above.
    - Claude inserts one screenshot per time window into the notes, using the descriptions and what the lecturer was saying; pandoc then writes the DOCX.
 
-Screenshots cost extra Claude calls (one per frame, plus one to place them), so they are the largest share of the token use. Set `ENABLE_SCREENSHOTS = false` to skip them.
+Screenshots cost extra Claude calls (one per frame, plus one to place them), so they are the largest share of the token use. Turn off `ENABLE_SCREENSHOTS` to skip them.
 
 ## Configuration
 
-At the top of `process.js`:
+Defaults are in `DEFAULT_SETTINGS` at the top of `process.js`. To override any of them, edit `settings.json` in this folder; the app's Settings tab writes the same file. For example:
 
-| Constant | Meaning |
+```json
+{ "ENABLE_SCREENSHOTS": false, "CLAUDE_CONCURRENCY": 2 }
+```
+
+| Setting | Meaning |
 |---|---|
 | `USE_SUBTITLES` | Use `.srt` files when found (default `true`) |
 | `SKIP_FIX_FOR_SUBTITLES` | Skip the Claude transcript-fix call for subtitles (default `true`) |
 | `ENABLE_SCREENSHOTS` | Frame extraction, classification, local frame analysis and DOCX (default `true`) |
 | `AUDIO_CONCURRENCY`, `WHISPER_CONCURRENCY`, `CLAUDE_CONCURRENCY` | Parallel jobs per stage (the local vision step shares the Whisper limit, since both use the GPU) |
+| `FRAME_CLASSIFY_CONCURRENCY` | Frames classified with Claude at once, per video (default `4`) |
+| `SCENE_CHANGE_THRESHOLD`, `SSIM_DUPLICATE_THRESHOLD` | Candidate-frame scene threshold and duplicate cut-off (defaults `0.02`, `0.9`) |
+| `PLACEMENT_WINDOW_SECONDS` | One screenshot per window of this length (default `30`) |
 | `CLAUDE_MODEL` | Model used for every Claude CLI call (default `claude-haiku-5-5`) |
 
 The note-generation prompt is `generateNotes()` in `process.js`; edit it to change the structure or style of the notes.

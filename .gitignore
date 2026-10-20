@@ -228,3 +228,7 @@ __marimo__/
 
 # whisper.cpp source/build and models
 tools/
+
+# GUI
+logs/
+settings.json

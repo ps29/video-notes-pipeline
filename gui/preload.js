@@ -1,0 +1,18 @@
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
+
+// The renderer's only access to the main process; it has no Node APIs itself.
+contextBridge.exposeInMainWorld('api', {
+  info: () => ipcRenderer.invoke('app:info'),
+  chooseRoot: () => ipcRenderer.invoke('app:choose-root'),
+  pick: kind => ipcRenderer.invoke('dialog:pick', kind),
+  start: input => ipcRenderer.invoke('run:start', input),
+  stop: () => ipcRenderer.invoke('run:stop'),
+  getSettings: () => ipcRenderer.invoke('settings:get'),
+  saveSettings: values => ipcRenderer.invoke('settings:save', values),
+  resetVideo: videoPath => ipcRenderer.invoke('video:reset', videoPath),
+  open: target => ipcRenderer.invoke('shell:open', target),
+  reveal: target => ipcRenderer.invoke('shell:reveal', target),
+  openLogs: () => ipcRenderer.invoke('shell:open-logs'),
+  pathForFile: file => webUtils.getPathForFile(file),
+  onPipeline: fn => ipcRenderer.on('pipeline', (_e, msg) => fn(msg)),
+});
