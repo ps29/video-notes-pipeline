@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node process.js",
     "check": "node deps-check.js",
+    "test": "node --test \"test/**/*.test.js\"",
     "gui": "electron .",
     "dist": "electron-builder --win nsis portable",
     "dist:installer": "electron-builder --win nsis",
@@ -53,5 +54,8 @@
     "portable": {
       "artifactName": "VideoNotes-Portable-${version}.${ext}"
     }
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.135.0"
   }
 }

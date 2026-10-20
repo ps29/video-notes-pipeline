@@ -34,13 +34,13 @@ jobs:
       - name: Syntax check (JavaScript)
         shell: bash
         run: |
-          for f in process.js gui/*.js; do node --check "$f"; done
+          for f in process.js deps-check.js gui/*.js llm/*.js; do node --check "$f"; done
 
       - name: Syntax check (Python)
         run: python -I -m py_compile transcribe.py frame_analyze.py
 
-      - name: Syntax check (deps-check)
-        run: node --check deps-check.js
+      - name: LLM provider tests (mock server)
+        run: npm test
 
       # Forks process.js the way the GUI does and checks it reports over IPC and ends cleanly
       # (no ffmpeg/Claude needed: the input path does not exist).

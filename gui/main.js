@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, shell, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, clipboard, safeStorage } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const { fork, execFile, spawn } = require('child_process');
@@ -114,6 +114,67 @@ function whereExe(name) {
   });
 }
 
+// ---------- API keys ----------
+// Saved keys are encrypted with Electron safeStorage (Windows DPAPI, tied to this Windows
+// user) in userData/keys.json, and put into this process's environment under the provider's
+// variable (e.g. OPENAI_API_KEY). The pipeline worker and the checks inherit them from there.
+// A saved key takes precedence over the same variable set in Windows.
+
+const KEYS_PATH = () => path.join(app.getPath('userData'), 'keys.json');
+const envBeforeKeys = {};
+
+function llmModule() {
+  const file = pipelineRoot && path.join(pipelineRoot, 'llm', 'index.js');
+  return file && fs.existsSync(file) ? require(file) : null;
+}
+
+// Variable names a key may be saved under: only the providers' own.
+function keyEnvNames() {
+  const llm = llmModule();
+  return new Set(llm ? Object.values(llm.PROVIDERS).map(p => p.keyEnv).filter(Boolean) : []);
+}
+
+function readKeys() {
+  try { return JSON.parse(fs.readFileSync(KEYS_PATH(), 'utf-8')); } catch { return {}; }
+}
+
+function applySavedKeys() {
+  if (!safeStorage.isEncryptionAvailable()) return;
+  for (const [name, encrypted] of Object.entries(readKeys())) {
+    if (!(name in envBeforeKeys)) envBeforeKeys[name] = process.env[name];
+    try { process.env[name] = safeStorage.decryptString(Buffer.from(encrypted, 'base64')); } catch { /* unreadable: ignore */ }
+  }
+}
+
+function saveKey(name, value) {
+  if (!keyEnvNames().has(name)) throw new Error(`Not an API key variable: ${name}`);
+  const keys = readKeys();
+  if (value) {
+    if (!safeStorage.isEncryptionAvailable()) throw new Error('Windows encryption is unavailable, so the key cannot be stored. Set the environment variable instead.');
+    keys[name] = safeStorage.encryptString(value).toString('base64');
+    if (!(name in envBeforeKeys)) envBeforeKeys[name] = process.env[name];
+    process.env[name] = value;
+  } else {
+    delete keys[name];
+    if (name in envBeforeKeys) {
+      if (envBeforeKeys[name] === undefined) delete process.env[name]; else process.env[name] = envBeforeKeys[name];
+      delete envBeforeKeys[name];
+    }
+  }
+  fs.mkdirSync(path.dirname(KEYS_PATH()), { recursive: true });
+  fs.writeFileSync(KEYS_PATH(), JSON.stringify(keys, null, 2), 'utf-8');
+}
+
+// Per variable: saved in the app, and/or present in the environment from Windows.
+function keyStatus() {
+  const saved = readKeys();
+  const status = {};
+  for (const name of keyEnvNames()) {
+    status[name] = { saved: name in saved, fromWindows: !(name in saved) && !!process.env[name] };
+  }
+  return status;
+}
+
 // deps-check.js lives in the pipeline folder next to process.js. Older pipeline folders
 // without it fall back to a PATH lookup for the header badges.
 function depsModule() {
@@ -173,6 +234,7 @@ function registerIpc() {
     if (canceled) return { pipelineRoot };
     if (!isPipelineRoot(filePaths[0])) return { pipelineRoot, error: 'That folder has no process.js' };
     pipelineRoot = filePaths[0];
+    applySavedKeys();
     writeConfig({ pipelineRoot });
     return { pipelineRoot };
   });
@@ -219,9 +281,23 @@ function registerIpc() {
   ipcMain.handle('deps:test', (_e, which) => {
     const deps = depsModule();
     if (which === 'gpu') return deps.testGpu();
-    if (which === 'claude') return deps.testClaude();
+    if (which === 'llm') return deps.testLlm();
     throw new Error(`Unknown test: ${which}`);
   });
+
+  ipcMain.handle('llm:providers', () => {
+    const llm = llmModule();
+    if (!llm) throw new Error('This pipeline folder has no llm/ module. Update it to a newer version.');
+    return llm.PROVIDERS;
+  });
+  // Lists models for the provider settings currently in the form (saved or not).
+  ipcMain.handle('llm:models', async (_e, overrides) => {
+    const llm = llmModule();
+    const settings = { ...depsModule().loadSettings(), ...overrides };
+    return llm.createLlm(settings).listModels();
+  });
+  ipcMain.handle('keys:status', () => keyStatus());
+  ipcMain.handle('keys:set', (_e, name, value) => { saveKey(name, String(value || '').trim()); return keyStatus(); });
   ipcMain.handle('deps:models', () => depsModule().fetchModels());
   ipcMain.handle('run:precheck', (_e, input) => precheck(input));
 
@@ -289,6 +365,7 @@ function createWindow() {
 
 app.whenReady().then(() => {
   pipelineRoot = resolvePipelineRoot();
+  applySavedKeys();
   registerIpc();
   createWindow();
 });
