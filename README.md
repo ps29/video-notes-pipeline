@@ -15,6 +15,18 @@ A Node.js pipeline that turns lecture videos into self-contained markdown study 
 python -m venv .venv
 ```
 
+### Checking your setup
+
+The app doesn't install anything. To see what's missing and how to install it, run:
+
+```bash
+npm run check              # every dependency: found or missing, version, how to install it
+npm run check -- --deep    # also: Whisper GPU test, and one short Claude request to confirm you're logged in
+npm run check -- --models  # also: Whisper and vision models available on Hugging Face, with sizes
+```
+
+The desktop app's **Dependencies** tab shows the same information. For each tool it shows the install commands with Copy buttons and links to the official download pages. It also has an **Open PowerShell here** button that opens a terminal in the pipeline folder, plus the same two deep tests. When you press **Start**, the app checks what that particular run needs (for example, Whisper only for videos without subtitles). If something is missing it tells you, but you can still start anyway.
+
 ## Transcription setup (Whisper)
 
 If your videos come with `.srt` subtitles (see [Subtitles](#subtitles)), you can skip this section. Otherwise pick **one** of the two backends. `transcribe.py` chooses automatically: whisper.cpp if it has been built, otherwise faster-whisper.
@@ -172,6 +184,10 @@ Defaults are in `DEFAULT_SETTINGS` at the top of `process.js`. To override any o
 | `SCENE_CHANGE_THRESHOLD`, `SSIM_DUPLICATE_THRESHOLD` | Candidate-frame scene threshold and duplicate cut-off (defaults `0.02`, `0.9`) |
 | `PLACEMENT_WINDOW_SECONDS` | One screenshot per window of this length (default `30`) |
 | `CLAUDE_MODEL` | Model used for every Claude CLI call (default `claude-haiku-5-5`) |
+| `WHISPER_MODEL` | Whisper model file in `tools\whisper.cpp\models` (e.g. `ggml-large-v3-turbo-q5_0.bin`). Empty = the most accurate one downloaded |
+| `VISION_MODEL`, `VISION_MMPROJ` | llama.cpp vision model and mmproj files in `tools\models`. Empty = the Qwen2.5-VL-3B files from `setup-llama.ps1` |
+
+Download other Whisper models with `.\setup-whisper.ps1 -Model <name>`, using any name from `npm run check -- --models` (for example `large-v3-turbo-q5_0`). In the app, **Dependencies → Models** lists them with their sizes, and a **Use** button appears once a model is downloaded.
 
 The note-generation prompt is `generateNotes()` in `process.js`; edit it to change the structure or style of the notes.
 

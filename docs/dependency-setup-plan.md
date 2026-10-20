@@ -1,6 +1,6 @@
 # Dependency setup plan
 
-Status: phase 1 in progress on `feat/dependency-setup` (branched from `feat/desktop-gui`, PR #2).
+Status: phase 1 implemented on `feat/dependency-setup` (branched from `feat/desktop-gui`, PR #2). It also adds `WHISPER_MODEL` / `VISION_MODEL` / `VISION_MMPROJ` settings and **Use** buttons, so a model chosen from the list is actually used. Before this, `transcribe.py` only recognised six hard-coded model names.
 
 ## Goal
 

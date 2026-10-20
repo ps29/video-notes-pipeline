@@ -1,7 +1,7 @@
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, clipboard } = require('electron');
 const fs = require('fs');
 const path = require('path');
-const { fork, execFile } = require('child_process');
+const { fork, execFile, spawn } = require('child_process');
 
 // The app only ships the GUI. The pipeline itself (process.js, the Python helpers, .venv
 // and tools/) runs from a "pipeline folder" on disk, so pipeline edits apply without a
@@ -114,11 +114,47 @@ function whereExe(name) {
   });
 }
 
+// deps-check.js lives in the pipeline folder next to process.js. Older pipeline folders
+// without it fall back to a PATH lookup for the header badges.
+function depsModule() {
+  const file = pipelineRoot && path.join(pipelineRoot, 'deps-check.js');
+  return file && fs.existsSync(file) ? require(file) : null;
+}
+
+const BADGES = ['ffmpeg', 'pandoc', 'claude', 'python', 'whisper'];
+
 async function preflight() {
-  const checks = await Promise.all(['ffmpeg', 'pandoc', 'claude'].map(async name => ({ name, path: await whereExe(name) })));
-  const venv = pipelineRoot && path.join(pipelineRoot, '.venv', 'Scripts', 'python.exe');
-  checks.push({ name: '.venv python', path: venv && fs.existsSync(venv) ? venv : null });
-  return checks;
+  const deps = depsModule();
+  if (deps) {
+    const { results } = await deps.checkAll();
+    return results.filter(r => BADGES.includes(r.id))
+      .map(r => ({ id: r.id, name: r.name, status: r.status, title: [r.version, r.detail].filter(Boolean).join(' — ') }));
+  }
+  return Promise.all(['ffmpeg', 'pandoc', 'claude'].map(async name => {
+    const found = await whereExe(name);
+    return { id: name, name, status: found ? 'ok' : 'missing', title: found || `${name} was not found on PATH` };
+  }));
+}
+
+// What the run for `input` needs, given the settings and which videos have subtitles.
+// Only informs: the renderer lets the user start anyway.
+async function precheck(input) {
+  const deps = depsModule();
+  if (!deps || !fs.existsSync(input)) return { missing: [], warnings: [] };
+  const pipeline = pipelineModule();
+  const settings = deps.loadSettings();
+  const videos = fs.statSync(input).isDirectory() ? pipeline.findVideos(input) : [input];
+  const withoutSubs = videos.filter(v => !(settings.USE_SUBTITLES && pipeline.findSubtitle(v))).length;
+  const needed = r => r.need === 'always'
+    || (r.need === 'screenshots' && settings.ENABLE_SCREENSHOTS)
+    || (r.need === 'noSubtitles' && withoutSubs > 0);
+  const { results } = await deps.checkAll();
+  return {
+    videos: videos.length,
+    withoutSubs,
+    missing: results.filter(r => r.status === 'missing' && needed(r)).map(r => ({ name: r.name, detail: r.detail })),
+    warnings: results.filter(r => r.status === 'warn' && needed(r)).map(r => ({ name: r.name, detail: r.detail })),
+  };
 }
 
 function registerIpc() {
@@ -173,6 +209,45 @@ function registerIpc() {
   ipcMain.handle('video:reset', (_e, videoPath) => {
     if (worker) throw new Error('Stop the run before resetting a video');
     return pipelineModule().resetVideo(videoPath);
+  });
+
+  ipcMain.handle('deps:check', async () => {
+    const deps = depsModule();
+    if (!deps) throw new Error('This pipeline folder has no deps-check.js. Update it to a newer version.');
+    return deps.checkAll();
+  });
+  ipcMain.handle('deps:test', (_e, which) => {
+    const deps = depsModule();
+    if (which === 'gpu') return deps.testGpu();
+    if (which === 'claude') return deps.testClaude();
+    throw new Error(`Unknown test: ${which}`);
+  });
+  ipcMain.handle('deps:models', () => depsModule().fetchModels());
+  ipcMain.handle('run:precheck', (_e, input) => precheck(input));
+
+  // Saves one setting (used by "Use this model"); the rest of settings.json is kept.
+  ipcMain.handle('settings:set', (_e, key, value) => {
+    if (worker) throw new Error('Settings cannot change while a run is in progress');
+    const { DEFAULT_SETTINGS, SETTINGS_PATH } = pipelineModule();
+    if (!(key in DEFAULT_SETTINGS)) throw new Error(`Unknown setting: ${key}`);
+    let saved = {};
+    try { saved = JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf-8')); } catch { /* new file */ }
+    saved[key] = value;
+    fs.writeFileSync(SETTINGS_PATH, JSON.stringify(saved, null, 2), 'utf-8');
+    return true;
+  });
+
+  ipcMain.handle('clipboard:write', (_e, text) => clipboard.writeText(String(text)));
+  ipcMain.handle('shell:external', (_e, url) => {
+    if (!/^https:\/\//i.test(url)) throw new Error('Only https links can be opened');
+    return shell.openExternal(url);
+  });
+  // A PowerShell window in the pipeline folder, for running the install commands shown.
+  ipcMain.handle('shell:terminal', () => {
+    if (!pipelineRoot) throw new Error('Choose the pipeline folder first');
+    spawn('cmd.exe', ['/c', 'start', '"Video Notes"', 'powershell.exe', '-NoExit', '-Command', `Set-Location -LiteralPath '${pipelineRoot.replace(/'/g, "''")}'`],
+      { detached: true, stdio: 'ignore', windowsHide: true, windowsVerbatimArguments: true }).unref();
+    return true;
   });
 
   ipcMain.handle('shell:open', (_e, target) => shell.openPath(target));
