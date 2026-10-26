@@ -22,6 +22,8 @@ contextBridge.exposeInMainWorld('api', {
   llmModels: overrides => ipcRenderer.invoke('llm:models', overrides),
   keyStatus: () => ipcRenderer.invoke('keys:status'),
   setKey: (name, value) => ipcRenderer.invoke('keys:set', name, value),
+  runSetup: (checkId, optionIndex) => ipcRenderer.invoke('setup:run', checkId, optionIndex),
+  runMissingSetup: () => ipcRenderer.invoke('setup:run-missing'),
   copy: text => ipcRenderer.invoke('clipboard:write', text),
   openExternal: url => ipcRenderer.invoke('shell:external', url),
   openTerminal: () => ipcRenderer.invoke('shell:terminal'),

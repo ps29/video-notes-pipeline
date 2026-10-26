@@ -103,9 +103,21 @@ jobs:
         run: npm version --no-git-tag-version "${GITHUB_REF_NAME#v}"
 
       - name: Build installer and portable exe
-        run: npx electron-builder --win nsis portable --publish never
+        run: npx electron-builder --config electron-builder.config.js --win nsis portable --publish never
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      # The installer must carry the pipeline (with the Anthropic SDK) and nothing big: without
+      # the config file electron-builder packs the whole folder.
+      - name: Check bundle contents
+        shell: bash
+        run: |
+          r=dist/win-unpacked/resources
+          for f in pipeline/process.js pipeline/deps-check.js pipeline/llm/index.js pipeline/transcribe.py pipeline/setup-whisper.ps1 pipeline/node_modules/@anthropic-ai/sdk/package.json; do
+            test -f "$r/$f" || { echo "missing $f"; exit 1; }
+          done
+          size=$(du -sm "$r" | cut -f1); echo "resources: ${size} MB"
+          [ "$size" -lt 200 ] || { echo "resources too large"; exit 1; }
 
       - uses: actions/upload-artifact@v7
         with:

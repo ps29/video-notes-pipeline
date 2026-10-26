@@ -139,7 +139,27 @@ npm run dist:installer    # dist\VideoNotes-Setup-<version>.exe
 npm run dist:portable     # dist\VideoNotes-Portable-<version>.exe
 ```
 
-The app contains only the GUI. The pipeline still runs from this folder, using `process.js`, the Python helpers, `.venv` and `tools\`. That keeps the exe small and lets pipeline edits take effect without a rebuild. On first launch, an installed app asks for this folder ("Pipeline folder") and remembers your choice. A portable exe placed in this folder finds it automatically. The prerequisites above are still needed, and the builds are unsigned, so Windows SmartScreen will warn on first run.
+**What the installer does:**
+- **Installs the app** per user, with no administrator prompt.
+- **Adds a "Tools Video Notes uses" page.** It lists ffmpeg, the Claude CLI, pandoc and winget, each marked found or not found on this PC. It also explains what Python, Whisper and the optional vision model are for.
+- **Offers a checkbox,** on by default: *Open the setup assistant when Video Notes starts.*
+- **Installs nothing else.** The page only informs.
+
+**The setup assistant** is the **Dependencies** tab. It opens on first start (unless you unticked the box), and portable builds open it once too. For each missing tool it offers an **Install** button. Clicking it:
+1. Shows the exact command first (for example `winget install --id Gyan.FFmpeg -e`).
+2. Runs it in a PowerShell window you can watch, where license, source and administrator prompts appear for you to answer.
+3. Re-checks when that window closes.
+
+The available installs are:
+- **winget packages:** ffmpeg, pandoc, the Claude CLI (followed by a **Log in** step), Ollama and LM Studio.
+- **Python:** uv, then `uv sync`.
+- **Larger setups:** Whisper's GPU build (`setup-whisper.ps1`) and the vision model (`setup-llama.ps1`). These have their own **Run setup** buttons, since they download several GB.
+
+**Install missing** does every quick one in a single window. You can also copy any command and run it yourself.
+
+**Where the pipeline lives:** the app carries a copy of the pipeline (`process.js`, `llm\`, the Python helpers and setup scripts, and the Anthropic SDK). On first start it copies it to `%LOCALAPPDATA%\VideoNotes\pipeline`, and setup writes `.venv`, `tools\` and `settings.json` there. Updates refresh the code files there and leave everything else alone. To use this repo folder instead, click **Pipeline:** in the app and choose it; a portable exe placed in this folder uses it automatically.
+
+The builds are unsigned, so Windows SmartScreen will warn on first run.
 
 #### CI/CD
 

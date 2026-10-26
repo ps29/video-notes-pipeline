@@ -306,6 +306,10 @@ function onPipeline(msg) {
     case 'end':
       state.result = msg.ok ? 'done' : 'failed';
       break;
+    case 'setup-finished':
+      depsState.running = (depsState.running || []).filter(id => !msg.ids.includes(id));
+      checkDeps();
+      break;
     case 'exit':
       state.running = false;
       state.runEnd = msg.ts;
@@ -583,19 +587,37 @@ function copyButton(text) {
   return btn;
 }
 
-function renderInstall(options) {
-  return el('div', { class: 'install' }, ...options.map(o => el('div', { class: 'install-row' },
+function renderInstall(r) {
+  const running = (depsState.running || []).includes(r.id);
+  return el('div', { class: 'install' }, ...r.install.map((o, index) => el('div', { class: 'install-row' },
     el('span', { class: 'install-label', textContent: o.label }),
     o.command ? el('code', { textContent: o.command }) : null,
     o.command ? copyButton(o.command) : null,
+    o.action ? el('button', {
+      class: 'small primary',
+      textContent: running ? 'Running…' : o.label === 'Log in' ? 'Log in…' : o.action.heavy ? 'Run setup…' : 'Install…',
+      disabled: running || state.running,
+      title: o.action.admin ? 'Opens PowerShell; may ask for administrator approval' : 'Shows the command, then runs it in a PowerShell window',
+      on: { click: () => runSetup(r.id, index) },
+    }) : null,
     o.url ? linkButton(o.url) : null,
     o.note ? el('div', { class: 'install-note', textContent: o.note }) : null,
   )));
 }
 
+async function runSetup(checkId, optionIndex) {
+  const res = await call(window.api.runSetup, checkId, optionIndex);
+  if (res?.started) { depsState.running = [...(depsState.running || []), checkId]; renderDeps(); }
+}
+
+async function runMissingSetup() {
+  const res = await call(window.api.runMissingSetup);
+  if (res?.started) { depsState.running = [...(depsState.running || []), ...(depsState.quickInstalls || [])]; renderDeps(); }
+}
+
 function renderDep(r) {
   const open = r.status === 'missing' || r.status === 'warn';
-  const install = r.install ? renderInstall(r.install) : null;
+  const install = r.install?.length ? renderInstall(r) : null;
   return el('div', { class: `dep ${r.status}` },
     el('div', { class: 'dep-head' },
       el('span', { class: `status ${r.status}`, textContent: STATUS_LABEL[r.status] || r.status }),
@@ -617,6 +639,10 @@ function renderDeps() {
   const count = s => results.filter(r => r.status === s).length;
   $('deps-summary').textContent = depsState.checking ? 'Checking…'
     : results.length ? `${count('ok')} OK · ${count('warn')} to check · ${count('missing')} missing` : '';
+  const quick = (depsState.quickInstalls || []).filter(id => !(depsState.running || []).includes(id));
+  $('deps-install-missing').classList.toggle('hidden', depsState.checking || quick.length === 0);
+  $('deps-install-missing').textContent = `Install missing (${quick.length})`;
+  $('deps-install-missing').disabled = state.running;
 }
 
 async function checkDeps() {
@@ -628,6 +654,8 @@ async function checkDeps() {
   $('deps-check').disabled = false;
   if (report) {
     depsState.results = report.results;
+    depsState.running = report.running || [];
+    depsState.quickInstalls = report.quickInstalls || [];
     renderBadges(report.results.filter(r => ['ffmpeg', 'pandoc', 'claude', 'python', 'whisper'].includes(r.id))
       .map(r => ({ id: r.id, name: r.name, status: r.status, title: [r.version, r.detail].filter(Boolean).join(' — ') })));
   }
@@ -724,7 +752,12 @@ async function refreshInfo() {
   const info = await call(window.api.info);
   if (!info) return;
   $('choose-root').textContent = info.pipelineRoot ? `Pipeline: ${info.pipelineRoot}` : 'Choose pipeline folder';
+  $('choose-root').title = info.pipelineRoot ? `${info.pipelineRoot}\nClick to use a different pipeline folder.` : '';
   renderBadges(info.checks);
+  if (info.openSetup) {
+    $('deps-welcome').classList.remove('hidden');
+    showTab('deps');
+  }
   if (!info.pipelineRoot) {
     showBanner('Pipeline folder not found. Choose the folder that contains process.js, .venv and tools/.',
       { label: 'Choose…', fn: chooseRoot });
@@ -769,6 +802,8 @@ function init() {
   document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => showTab(tab.dataset.tab)));
 
   $('deps-check').addEventListener('click', checkDeps);
+  $('deps-install-missing').addEventListener('click', runMissingSetup);
+  $('deps-welcome-close').addEventListener('click', () => $('deps-welcome').classList.add('hidden'));
   $('deps-test-gpu').addEventListener('click', () => runDepTest('gpu', $('deps-test-gpu')));
   $('deps-test-llm').addEventListener('click', () => runDepTest('llm', $('deps-test-llm')));
   $('deps-terminal').addEventListener('click', () => call(window.api.openTerminal));

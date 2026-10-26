@@ -1,7 +1,7 @@
 const { app, BrowserWindow, ipcMain, dialog, shell, clipboard, safeStorage } = require('electron');
 const fs = require('fs');
 const path = require('path');
-const { fork, execFile, spawn } = require('child_process');
+const { fork, execFile, execFileSync, spawn } = require('child_process');
 
 // The app only ships the GUI. The pipeline itself (process.js, the Python helpers, .venv
 // and tools/) runs from a "pipeline folder" on disk, so pipeline edits apply without a
@@ -30,7 +30,43 @@ function resolvePipelineRoot() {
     process.env.PORTABLE_EXECUTABLE_DIR,
     path.dirname(process.execPath),
     path.resolve(__dirname, '..'),
-  ].find(isPipelineRoot) || null;
+  ].find(isPipelineRoot) || bundledPipeline();
+}
+
+// Packaged builds carry a copy of the pipeline (resources/pipeline). It runs from a writable
+// per-user folder, because setup writes .venv, tools/ (Whisper, models) and settings.json next
+// to it. Code files are refreshed when the app version changes; nothing else there is touched.
+function bundledPipeline() {
+  const src = app.isPackaged && path.join(process.resourcesPath, 'pipeline');
+  if (!src || !isPipelineRoot(src)) return null;
+  const dest = path.join(process.env.LOCALAPPDATA || app.getPath('userData'), 'VideoNotes', 'pipeline');
+  const stamp = path.join(dest, '.bundle-version');
+  let current = null;
+  try { current = fs.readFileSync(stamp, 'utf-8').trim(); } catch { /* first run */ }
+  if (current !== app.getVersion() || !isPipelineRoot(dest)) {
+    fs.mkdirSync(dest, { recursive: true });
+    fs.cpSync(src, dest, { recursive: true, force: true });
+    fs.writeFileSync(stamp, app.getVersion(), 'utf-8');
+  }
+  return dest;
+}
+
+// Tools installed while the app is open (winget adds them to the user or machine PATH) are only
+// visible to new processes. This re-reads PATH from the registry so checks and runs find them.
+function refreshPath() {
+  const read = (key) => {
+    try {
+      const reg = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'reg.exe');
+      const out = execFileSync(reg, ['query', key, '/v', 'Path'], { encoding: 'utf-8', windowsHide: true });
+      const value = out.match(/Path\s+REG_(?:EXPAND_)?SZ\s+(.*)/i)?.[1]?.trim() || '';
+      return value.replace(/%([^%]+)%/g, (m, name) => process.env[name] ?? m);
+    } catch {
+      return '';
+    }
+  };
+  const machine = read('HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment');
+  const user = read('HKCU\\Environment');
+  if (machine || user) process.env.Path = [machine, user].filter(Boolean).join(';');
 }
 
 let win = null;
@@ -61,6 +97,7 @@ function pipelineModule() {
 function startRun(input) {
   if (worker) throw new Error('A run is already in progress');
   if (!pipelineRoot) throw new Error('Choose the pipeline folder first');
+  refreshPath();
 
   const logsDir = path.join(pipelineRoot, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
@@ -218,13 +255,140 @@ async function precheck(input) {
   };
 }
 
+// ---------- setup assistant ----------
+// Runs an install option's `action` (defined in deps-check.js) in a visible PowerShell window
+// in the pipeline folder, after the user confirms the exact commands. Only actions from the
+// last check are runnable; the renderer refers to them by check id and option index.
+
+let lastCheck = null;
+const setupWindows = new Map(); // check id -> child process
+
+function psQuote(text) {
+  return `'${String(text).replace(/'/g, "''")}'`;
+}
+
+// PowerShell for one action. winget runs without --accept-* flags, so its license and source
+// prompts appear in the window for the user to answer.
+function actionScript(action) {
+  const lines = [
+    "$ErrorActionPreference = 'Continue'",
+    "function Update-Path { $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User') }",
+  ];
+  for (const step of action.steps) {
+    if (step.winget) {
+      const install = `Write-Host '> winget install --id ${step.winget} -e' -ForegroundColor Cyan; winget install --id ${step.winget} -e`;
+      lines.push(step.exe
+        ? `if (Get-Command ${psQuote(step.exe)} -ErrorAction SilentlyContinue) { Write-Host '${step.exe} is already installed.' -ForegroundColor Green } else { ${install} }`
+        : install);
+    } else if (step.script) {
+      if (!/^[\w.-]+\.ps1$/.test(step.script)) throw new Error(`Bad script name: ${step.script}`);
+      lines.push(`Write-Host '> .\\${step.script}' -ForegroundColor Cyan; & ${psQuote(path.join(pipelineRoot, step.script))}`);
+    } else if (step.run) {
+      lines.push(`Write-Host ${psQuote(`> ${step.run}`)} -ForegroundColor Cyan; ${step.run}`);
+    }
+    lines.push('Update-Path');
+  }
+  lines.push("Write-Host ''; Write-Host 'Done. You can close this window (Video Notes re-checks when it closes).' -ForegroundColor Green; Read-Host 'Press Enter to close'");
+  return lines.join('\n');
+}
+
+function findAction(checkId, optionIndex) {
+  const result = lastCheck?.results.find(r => r.id === checkId);
+  const option = result?.install?.[optionIndex];
+  if (!option?.action) throw new Error('That setup step is no longer available. Press "Check again" and retry.');
+  return { result, option };
+}
+
+// Shows what will run, then runs it. Resolves when the window has been opened (or cancelled).
+async function runSetup(items, title) {
+  if (worker) throw new Error('Stop the run before installing tools.');
+  const busy = items.find(i => setupWindows.has(i.result.id));
+  if (busy) throw new Error(`Setup for ${busy.result.name} is already running in another window.`);
+  const admin = items.some(i => i.option.action.admin);
+  const heavy = items.some(i => i.option.action.heavy);
+  const detail = [
+    'Video Notes will open a PowerShell window in the pipeline folder and run:',
+    '',
+    ...items.map(i => `• ${i.result.name}: ${i.option.command}`),
+    '',
+    `Folder: ${pipelineRoot}`,
+    'Package licenses and any prompts appear in that window for you to answer.',
+    admin ? 'Some steps install system tools and will ask for administrator approval.' : null,
+    heavy ? 'This can download several GB and take a while.' : null,
+  ].filter(l => l !== null).join('\n');
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'question', buttons: ['Run', 'Cancel'], defaultId: 0, cancelId: 1, noLink: true,
+    title: 'Video Notes setup', message: title, detail,
+  });
+  if (response !== 0) return { started: false };
+
+  const script = items.map(i => actionScript(i.option.action)).join('\n')
+    // One combined window shouldn't stop after the first item's "press Enter".
+    .replace(/Write-Host ''; Write-Host 'Done\.[^\n]*\n(?=.)/g, '');
+  // `start /wait` gives PowerShell its own console (with keyboard input for prompts and the
+  // final "press Enter"); the hidden cmd.exe exits when that window closes. The script goes
+  // in as -EncodedCommand (UTF-16LE base64), so no quoting can break it.
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  const child = spawn('cmd.exe', ['/d', '/c', 'start', '"Video Notes setup"', '/wait',
+    'powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], {
+    cwd: pipelineRoot, stdio: 'ignore', windowsHide: true, windowsVerbatimArguments: true,
+  });
+  const ids = items.map(i => i.result.id);
+  ids.forEach(id => setupWindows.set(id, child));
+  emit({ type: 'log', level: 'info', msg: `Setup started: ${items.map(i => `${i.result.name} (${i.option.command})`).join('; ')}`, video: null, ts: Date.now() });
+  child.on('exit', code => {
+    ids.forEach(id => setupWindows.delete(id));
+    refreshPath();
+    emit({ type: 'log', level: 'info', msg: `Setup window closed${code ? ` (exit ${code})` : ''}. Re-checking dependencies.`, video: null, ts: Date.now() });
+    toRenderer({ type: 'setup-finished', ids, ts: Date.now() });
+  });
+  return { started: true };
+}
+
+// "Install everything missing": the first runnable option of each missing item that every run
+// (or, with screenshots on, every screenshot run) needs, plus Python. Large builds (Whisper,
+// llama.cpp) are left to their own buttons.
+function missingQuickInstalls() {
+  const settings = depsModule().loadSettings();
+  const wanted = r => r.need === 'always' || r.need === 'noSubtitles' || (r.need === 'screenshots' && settings.ENABLE_SCREENSHOTS);
+  const items = [];
+  for (const result of lastCheck?.results || []) {
+    if (result.status !== 'missing' || !wanted(result)) continue;
+    const optionIndex = (result.install || []).findIndex(o => o.action && !o.action.heavy);
+    if (optionIndex !== -1) items.push({ result, option: result.install[optionIndex] });
+  }
+  return items;
+}
+
+// First start after install: the installer's checkbox leaves "open" or "skip" in
+// userData/setup-choice.txt. Without it (portable, dev), the assistant opens once.
+function takeFirstRunSetup() {
+  const config = readConfig();
+  const choiceFile = path.join(app.getPath('userData'), 'setup-choice.txt');
+  let choice = null;
+  try { choice = fs.readFileSync(choiceFile, 'utf-8').trim(); fs.rmSync(choiceFile, { force: true }); } catch { /* none */ }
+  if (choice === 'open') { writeConfig({ setupSeen: true }); return true; }
+  if (choice === 'skip' || config.setupSeen) { if (!config.setupSeen) writeConfig({ setupSeen: true }); return false; }
+  writeConfig({ setupSeen: true });
+  return true;
+}
+
+let openSetupOnStart = false;
+
 function registerIpc() {
-  ipcMain.handle('app:info', async () => ({
-    pipelineRoot,
-    running: !!worker,
-    checks: await preflight(),
-    version: app.getVersion(),
-  }));
+  ipcMain.handle('app:info', async () => {
+    refreshPath();
+    const info = {
+      pipelineRoot,
+      running: !!worker,
+      checks: await preflight(),
+      version: app.getVersion(),
+      bundled: !!pipelineRoot && app.isPackaged && pipelineRoot.startsWith(path.join(process.env.LOCALAPPDATA || '', 'VideoNotes')),
+      openSetup: openSetupOnStart,
+    };
+    openSetupOnStart = false;
+    return info;
+  });
 
   ipcMain.handle('app:choose-root', async () => {
     const { canceled, filePaths } = await dialog.showOpenDialog(win, {
@@ -276,7 +440,20 @@ function registerIpc() {
   ipcMain.handle('deps:check', async () => {
     const deps = depsModule();
     if (!deps) throw new Error('This pipeline folder has no deps-check.js. Update it to a newer version.');
-    return deps.checkAll();
+    refreshPath();
+    lastCheck = await deps.checkAll();
+    lastCheck.running = [...setupWindows.keys()];
+    lastCheck.quickInstalls = missingQuickInstalls().map(i => i.result.id);
+    return lastCheck;
+  });
+  ipcMain.handle('setup:run', (_e, checkId, optionIndex) => {
+    const item = findAction(checkId, optionIndex);
+    return runSetup([item], `Set up ${item.result.name}?`);
+  });
+  ipcMain.handle('setup:run-missing', () => {
+    const items = missingQuickInstalls();
+    if (!items.length) throw new Error('Nothing missing can be installed automatically. See the individual items.');
+    return runSetup(items, `Install ${items.length} missing tool${items.length > 1 ? 's' : ''}?`);
   });
   ipcMain.handle('deps:test', (_e, which) => {
     const deps = depsModule();
@@ -337,6 +514,7 @@ function createWindow() {
     height: 860,
     minWidth: 900,
     minHeight: 600,
+    show: false,
     title: 'Video Notes',
     backgroundColor: '#14161a',
     autoHideMenuBar: true,
@@ -348,6 +526,19 @@ function createWindow() {
     },
   });
   win.loadFile(path.join(__dirname, 'index.html'));
+
+  win.on('ready-to-show', () => {
+    win.show();
+  });
+
+  win.webContents.on('crashed', () => {
+    console.error('FATAL: webContents crashed');
+    process.exit(1);
+  });
+
+  win.on('unresponsive', () => {
+    console.error('WARNING: window unresponsive');
+  });
 
   win.on('close', e => {
     if (!worker) return;
@@ -366,8 +557,25 @@ function createWindow() {
 app.whenReady().then(() => {
   pipelineRoot = resolvePipelineRoot();
   applySavedKeys();
+  openSetupOnStart = takeFirstRunSetup();
   registerIpc();
   createWindow();
+}).catch(err => {
+  console.error('FATAL ERROR in app.whenReady:', err);
+  process.exit(1);
 });
 
-app.on('window-all-closed', () => app.quit());
+app.on('window-all-closed', () => {
+  console.error('DEBUG: window-all-closed event');
+  app.quit();
+});
+
+process.on('uncaughtException', err => {
+  console.error('FATAL UNCAUGHT EXCEPTION:', err);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('UNHANDLED REJECTION:', reason);
+  process.exit(1);
+});
