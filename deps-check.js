@@ -2,7 +2,7 @@
 // Nothing is installed: this only looks, and runs version commands.
 //
 //   node deps-check.js            table of results + install instructions
-//   node deps-check.js --deep     also run the GPU test and a Claude login test (one short request)
+//   node deps-check.js --deep     also run the GPU test and an LLM test (one short prompt)
 //   node deps-check.js --models   also list Whisper/vision models from Hugging Face
 //   node deps-check.js --json     machine-readable output (used by CI)
 //
@@ -96,16 +96,81 @@ const checkPandoc = settings => checkTool({
   ],
 }).then(r => (settings.ENABLE_SCREENSHOTS || r.status === 'ok' ? r : { ...r, status: 'off', detail: 'Not needed: screenshots are turned off in Settings.' }));
 
-const checkClaude = () => checkTool({
-  id: 'claude', name: 'Claude CLI', exe: 'claude', versionArgs: ['--version'],
-  parseVersion: out => firstLine(out),
-  purpose: 'Fixes transcripts, writes the notes, and classifies and places screenshots.',
-  need: 'always',
-  install: [
-    { label: 'PowerShell', command: 'irm https://claude.ai/install.ps1 | iex', note: 'Then run "claude" once and log in. Use "Test Claude login" here to confirm.' },
-    { label: 'Docs', url: 'https://code.claude.com/docs/en/setup' },
+// Only needed when the LLM provider is the Claude CLI (the default).
+const checkClaude = settings => {
+  const inUse = (settings.LLM_PROVIDER || 'claude-cli') === 'claude-cli';
+  return checkTool({
+    id: 'claude', name: 'Claude CLI', exe: 'claude', versionArgs: ['--version'],
+    parseVersion: out => firstLine(out),
+    purpose: 'Fixes transcripts, writes the notes, and classifies and places screenshots (when the LLM provider is "Claude CLI").',
+    need: inUse ? 'always' : 'optional',
+    install: [
+      { label: 'PowerShell', command: 'irm https://claude.ai/install.ps1 | iex', note: 'Then run "claude" once and log in. Use "Test LLM" here to confirm.' },
+      { label: 'Docs', url: 'https://code.claude.com/docs/en/setup' },
+    ],
+  }).then(r => (inUse || r.status === 'ok' ? r : { ...r, status: 'off', detail: `Not needed: the LLM provider is ${settings.LLM_PROVIDER}.` }));
+};
+
+// Setup hints per LLM provider preset (see llm/index.js).
+const LLM_INSTALL = {
+  'claude-cli': [{ label: 'Note', note: 'Uses the Claude CLI above.' }],
+  anthropic: [
+    { label: 'API key', url: 'https://platform.claude.com/settings/keys', note: 'Create a key, then paste it in Settings → LLM provider (or set ANTHROPIC_API_KEY).' },
+    { label: 'SDK', command: 'npm install', note: 'Run in the pipeline folder if the Anthropic SDK is reported missing.' },
   ],
-});
+  openai: [{ label: 'API key', url: 'https://platform.openai.com/api-keys', note: 'Paste it in Settings → LLM provider (or set OPENAI_API_KEY).' }],
+  openrouter: [{ label: 'API key', url: 'https://openrouter.ai/keys', note: 'Paste it in Settings → LLM provider (or set OPENROUTER_API_KEY).' }],
+  ollama: [
+    { label: 'Install', url: 'https://ollama.com/download' },
+    { label: 'Get a model', command: 'ollama pull <model>', note: 'Pick a model at ollama.com/library. Frame classification needs one that reads images (ollama.com/search?c=vision); set it as the vision model.' },
+  ],
+  lmstudio: [
+    { label: 'Install', url: 'https://lmstudio.ai/download' },
+    { label: 'Start server', command: 'lms server start', note: 'Load a model with a context length of 32k or more (lms load <model> --context-length 32768). If "Require authentication" is on, add LM Studio\'s API token in Settings.' },
+    { label: 'Auth docs', url: 'https://lmstudio.ai/docs/developer/core/authentication' },
+  ],
+  lemonade: [{ label: 'Install', url: 'https://lemonade-server.ai/', note: 'Start Lemonade and load a model, then pick it in Settings → LLM provider.' }],
+  custom: [{ label: 'Note', note: 'Point the base URL at the server\'s OpenAI-compatible /v1 address and choose a model.' }],
+};
+
+// Checks that the configured provider answers and has the configured models. Lists models
+// only (no tokens used); "Test LLM" sends a real prompt.
+async function checkLlm(settings) {
+  const { createLlm, PROVIDERS } = require('./llm');
+  const llm = createLlm(settings);
+  const { config } = llm;
+  const base = {
+    id: 'llm', name: `LLM: ${config.label}`, need: 'always', neededFor: NEED.always,
+    purpose: 'Fixes transcripts, writes the notes, and classifies and places screenshots. Choose the provider in Settings → LLM provider.',
+    install: LLM_INSTALL[config.id] || [],
+  };
+  if (config.protocol === 'claude-cli') {
+    return { ...base, status: 'ok', version: config.model, detail: 'Uses the Claude CLI (checked separately). Use "Test LLM" to confirm you are logged in.' };
+  }
+  if (!config.model) return { ...base, status: 'missing', detail: 'No model chosen. Pick one in Settings → LLM provider.' };
+  if (config.keyEnv && !config.keyOptional && !config.apiKey) {
+    return { ...base, status: 'missing', detail: `No API key: add one in Settings → LLM provider, or set ${config.keyEnv}.` };
+  }
+  let models;
+  try {
+    models = await llm.listModels();
+  } catch (err) {
+    return { ...base, status: 'missing', path: config.baseUrl || undefined, detail: err.message };
+  }
+  const ids = new Set(models.map(m => m.id));
+  const wanted = [...new Set([config.model, settings.ENABLE_SCREENSHOTS ? config.visionModel : null].filter(Boolean))];
+  const absent = ids.size ? wanted.filter(m => !ids.has(m)) : [];
+  const version = config.visionModel !== config.model ? `${config.model} · vision: ${config.visionModel}` : config.model;
+  if (absent.length) {
+    const sample = [...ids].slice(0, 8).join(', ');
+    return { ...base, status: 'warn', version, path: config.baseUrl || undefined, detail: `The server answered, but doesn't list ${absent.join(' or ')}. Available: ${sample}${ids.size > 8 ? ', ...' : ''}` };
+  }
+  const local = PROVIDERS[config.id]?.local;
+  return {
+    ...base, status: 'ok', version, path: config.baseUrl || undefined,
+    detail: `${models.length} model(s) available.${local ? ' Runs on this PC: keep CLAUDE_CONCURRENCY at 1-2.' : ''} Use "Test LLM" to send a short prompt.`,
+  };
+}
 
 async function checkPython() {
   const base = {
@@ -202,9 +267,9 @@ async function checkVision(settings) {
 async function checkAll() {
   const settings = loadSettings();
   const results = await Promise.all([
-    checkFfmpeg(), checkPandoc(settings), checkClaude(), checkPython(), checkWhisper(settings), checkVulkan(), checkVision(settings),
+    checkFfmpeg(), checkPandoc(settings), checkLlm(settings), checkClaude(settings), checkPython(), checkWhisper(settings), checkVulkan(), checkVision(settings),
   ]);
-  return { root: ROOT, checkedAt: new Date().toISOString(), settings: { ENABLE_SCREENSHOTS: settings.ENABLE_SCREENSHOTS, CLAUDE_MODEL: settings.CLAUDE_MODEL, WHISPER_MODEL: settings.WHISPER_MODEL }, results };
+  return { root: ROOT, checkedAt: new Date().toISOString(), settings: { ENABLE_SCREENSHOTS: settings.ENABLE_SCREENSHOTS, LLM_PROVIDER: settings.LLM_PROVIDER, CLAUDE_MODEL: settings.CLAUDE_MODEL, LLM_MODEL: settings.LLM_MODEL, WHISPER_MODEL: settings.WHISPER_MODEL }, results };
 }
 
 // ---------- deep tests (slower; the Claude one makes a real request) ----------
@@ -227,19 +292,27 @@ async function testGpu() {
     : { ...base, status: 'warn', detail: `Worked, but on the CPU (${seconds} s). Update the GPU driver to use Vulkan.` };
 }
 
-async function testClaude() {
+// Sends one short prompt through the configured provider (a real, billed request for paid APIs).
+async function testLlm() {
   const settings = loadSettings();
-  const base = { id: 'claude-test', name: 'Claude login test' };
-  const exe = await locate('claude');
-  if (!exe) return { ...base, status: 'missing', detail: 'The Claude CLI is not installed.' };
-  const res = await run(exe, ['-p', '--model', settings.CLAUDE_MODEL], { timeout: 90000, input: 'Reply with exactly: OK' });
-  if (res.ok && /\bOK\b/i.test(res.stdout)) return { ...base, status: 'ok', version: settings.CLAUDE_MODEL, detail: 'Logged in, and the configured model answered.' };
-  const reason = firstLine(res.stdout) || firstLine(res.stderr) || res.error?.message || 'no output';
-  return { ...base, status: 'missing', detail: `The request failed: ${reason}. Run "claude" in a terminal to log in, and check CLAUDE_MODEL in Settings.` };
+  const { createLlm } = require('./llm');
+  const llm = createLlm(settings);
+  const base = { id: 'llm-test', name: `LLM test (${llm.config.label})` };
+  const started = Date.now();
+  try {
+    const reply = await llm.complete('Reply with exactly: OK');
+    const seconds = ((Date.now() - started) / 1000).toFixed(1);
+    return /\bOK\b/i.test(reply)
+      ? { ...base, status: 'ok', version: llm.config.model, detail: `The model answered in ${seconds} s.` }
+      : { ...base, status: 'warn', version: llm.config.model, detail: `The model answered in ${seconds} s, but not as asked: "${reply.slice(0, 120)}". Small models may struggle with the pipeline's prompts.` };
+  } catch (err) {
+    const hint = llm.config.protocol === 'claude-cli' ? ' Run "claude" in a terminal to log in, and check CLAUDE_MODEL in Settings.' : '';
+    return { ...base, status: 'missing', detail: `${err.message}${hint}` };
+  }
 }
 
 async function deepTests() {
-  return Promise.all([testGpu(), testClaude()]);
+  return Promise.all([testGpu(), testLlm()]);
 }
 
 // ---------- model lists from Hugging Face (information only) ----------
@@ -322,7 +395,7 @@ const mb = n => (n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${Math.round(n / 1e6
 
 function printResults(results) {
   for (const r of results) {
-    console.log(`${ICON[r.status] || '?'} ${r.name.padEnd(28)} ${[r.version, r.detail].filter(Boolean).join(' — ')}`);
+    console.log(`${ICON[r.status] || '?'} ${r.name.padEnd(32)} ${[r.version, r.detail].filter(Boolean).join(' — ')}`);
   }
   const todo = results.filter(r => r.install && ['missing', 'warn'].includes(r.status));
   for (const r of todo) {
@@ -361,6 +434,6 @@ async function cli() {
   process.exitCode = report.results.some(r => r.need === 'always' && r.status === 'missing') ? 1 : 0;
 }
 
-module.exports = { checkAll, deepTests, testGpu, testClaude, fetchModels, loadSettings, NEED };
+module.exports = { checkAll, deepTests, testGpu, testLlm, fetchModels, loadSettings, NEED };
 
 if (require.main === module) cli();

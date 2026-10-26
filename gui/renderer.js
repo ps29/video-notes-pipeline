@@ -18,8 +18,8 @@ const SETTING_HELP = {
   SKIP_FIX_FOR_SUBTITLES: 'Skip the Claude transcript-fix call for subtitle transcripts.',
   AUDIO_CONCURRENCY: 'Parallel ffmpeg jobs (audio and frame extraction).',
   WHISPER_CONCURRENCY: 'Parallel GPU jobs (Whisper and the vision model). Keep at 1.',
-  CLAUDE_CONCURRENCY: 'Parallel Claude CLI calls for fix/notes/DOCX.',
-  FRAME_CLASSIFY_CONCURRENCY: 'Frames classified with Claude at once, per video.',
+  CLAUDE_CONCURRENCY: 'Parallel LLM calls for fix/notes/DOCX (any provider). Use 1-2 for a local model.',
+  FRAME_CLASSIFY_CONCURRENCY: 'Frames classified by the LLM at once, per video. Use 1-2 for a local model.',
   SCENE_CHANGE_THRESHOLD: 'ffmpeg scene score for candidate frames. Higher = fewer frames.',
   SSIM_DUPLICATE_THRESHOLD: 'Frames at least this similar to the last kept frame are dropped.',
   PLACEMENT_WINDOW_SECONDS: 'One screenshot per window of this many seconds.',
@@ -370,41 +370,168 @@ async function stop() {
 
 // ---------- settings ----------
 
-async function loadSettings() {
-  const res = await call(window.api.getSettings);
+// Edited in the LLM provider card instead of the generic form below it.
+const LLM_KEYS = ['LLM_PROVIDER', 'CLAUDE_MODEL', 'LLM_BASE_URL', 'LLM_MODEL', 'LLM_VISION_MODEL',
+  'LLM_CONTEXT_TOKENS', 'LLM_MAX_OUTPUT_TOKENS', 'LLM_TIMEOUT_MINUTES', 'LOCAL_LLM_GPU_LOCK'];
+
+const llmState = { providers: null, keys: {}, models: [] };
+
+// `quiet` skips the error banner: at startup the pipeline folder may not be chosen yet.
+async function loadSettings({ quiet = false } = {}) {
+  const get = fn => (quiet ? fn().catch(() => undefined) : call(fn));
+  const [res, providers, keys] = await Promise.all([get(window.api.getSettings), get(window.api.llmProviders), get(window.api.keyStatus)]);
   if (!res) return;
   state.settings = res;
+  llmState.providers = providers || null;
+  llmState.keys = keys || {};
   renderSettings(res.values);
 }
 
+function settingInput(key, value, def, extra = {}) {
+  const id = `set-${key}`;
+  const input = typeof def === 'boolean'
+    ? el('input', { type: 'checkbox', id, checked: !!value, ...extra })
+    : el('input', { type: typeof def === 'number' ? 'number' : 'text', id, value: String(value ?? ''), step: 'any', ...extra });
+  input.dataset.key = key;
+  return input;
+}
+
 function renderSettings(values) {
+  renderLlmCard(values);
   const form = $('settings-form');
   form.replaceChildren();
   for (const [key, def] of Object.entries(state.settings.defaults)) {
-    const id = `set-${key}`;
-    const value = values[key];
-    const input = typeof def === 'boolean'
-      ? el('input', { type: 'checkbox', id, checked: !!value })
-      : el('input', { type: typeof def === 'number' ? 'number' : 'text', id, value: String(value), step: 'any' });
-    input.dataset.key = key;
+    if (LLM_KEYS.includes(key)) continue;
+    const input = settingInput(key, values[key], def);
     form.append(
-      el('label', { htmlFor: id, textContent: key }),
+      el('label', { htmlFor: input.id, textContent: key }),
       el('div', { class: 'field' }, input,
-        el('span', { class: 'help', textContent: `${SETTING_HELP[key] || ''} Default: ${def}` })),
+        el('span', { class: 'help', textContent: `${SETTING_HELP[key] || ''} Default: ${def === '' ? '(empty)' : def}` })),
     );
   }
 }
 
+// One labelled row of the provider card; `show` hides rows that don't apply to the provider.
+function llmRow(label, control, help, show = true) {
+  return el('div', { class: `llm-row${show ? '' : ' hidden'}` },
+    el('label', { htmlFor: control.id || '', textContent: label }),
+    el('div', { class: 'field' }, control, help ? el('span', { class: 'help', textContent: help }) : null));
+}
+
+function renderLlmCard(values) {
+  const card = $('llm-card');
+  const providers = llmState.providers;
+  if (!providers) {
+    card.replaceChildren(el('p', { class: 'muted', textContent: 'This pipeline folder predates LLM provider selection; the Claude CLI is used.' }));
+    return;
+  }
+  const defs = state.settings.defaults;
+  const id = providers[values.LLM_PROVIDER] ? values.LLM_PROVIDER : 'claude-cli';
+  const p = providers[id];
+  const claude = p.protocol === 'claude-cli' || p.protocol === 'anthropic';
+
+  const select = el('select', { id: 'set-LLM_PROVIDER' },
+    ...Object.entries(providers).map(([key, prov]) => el('option', { value: key, textContent: prov.label, selected: key === id })));
+  select.dataset.key = 'LLM_PROVIDER';
+  // Re-render for the new provider, keeping whatever else was typed.
+  select.addEventListener('change', () => {
+    let current;
+    try { current = readSettingsForm(); } catch { current = { ...state.settings.values }; }
+    llmState.models = [];
+    // The base URL belongs to the previous provider; the new one starts from its default.
+    renderLlmCard({ ...current, LLM_PROVIDER: select.value, LLM_BASE_URL: '' });
+  });
+
+  const modelKey = claude ? 'CLAUDE_MODEL' : 'LLM_MODEL';
+  const modelInput = settingInput(modelKey, values[modelKey], defs[modelKey], { placeholder: claude ? defs.CLAUDE_MODEL : 'e.g. qwen3:14b, gpt-5-mini', autocomplete: 'off' });
+  modelInput.setAttribute('list', 'llm-model-list');
+  const visionInput = settingInput('LLM_VISION_MODEL', values.LLM_VISION_MODEL, defs.LLM_VISION_MODEL, { placeholder: 'same as the model', autocomplete: 'off' });
+  visionInput.setAttribute('list', 'llm-model-list');
+  const datalist = el('datalist', { id: 'llm-model-list' }, ...llmState.models.map(m => el('option', { value: m.id, label: m.label || '' })));
+
+  const loadBtn = el('button', { class: 'small', textContent: 'Load models', type: 'button' });
+  const modelsMsg = el('span', { class: 'muted' });
+  loadBtn.addEventListener('click', async () => {
+    loadBtn.disabled = true;
+    modelsMsg.textContent = 'Asking the server…';
+    let overrides;
+    try { overrides = readSettingsForm(); } catch (err) { modelsMsg.textContent = err.message; loadBtn.disabled = false; return; }
+    const models = await call(window.api.llmModels, overrides);
+    loadBtn.disabled = false;
+    if (!models) { modelsMsg.textContent = 'Could not list models (see the message above).'; return; }
+    llmState.models = models;
+    datalist.replaceChildren(...models.map(m => el('option', { value: m.id, label: m.label || '' })));
+    modelsMsg.textContent = models.length ? `${models.length} model(s): pick one from the field's dropdown.` : 'The server listed no models.';
+  });
+
+  card.replaceChildren(...[
+    el('h2', { class: 'settings-heading', textContent: 'LLM provider' }),
+    el('p', { class: 'muted', textContent: 'Which model fixes transcripts, writes the notes, and classifies and places screenshots. Whisper and the screenshot-description model are set separately below.' }),
+    llmRow('Provider', select, p.hint),
+    llmRow('Base URL', settingInput('LLM_BASE_URL', values.LLM_BASE_URL, defs.LLM_BASE_URL, { placeholder: p.baseUrl || 'http://host:port/v1' }),
+      p.baseUrl ? `Leave empty for ${p.baseUrl}.` : 'The server\'s OpenAI-compatible address, usually ending in /v1.', !claude),
+    p.keyEnv ? llmRow(`API key${p.keyOptional ? ' (optional)' : ''}`, renderKeyControl(p), null) : null,
+    llmRow('Model', el('div', { class: 'inline' }, modelInput, loadBtn, modelsMsg),
+      claude ? 'Claude model ID, e.g. claude-haiku-5-5, claude-sonnet-5-5, claude-opus-5-5.' : 'Press Load models to list what the server has.'),
+    llmRow('Vision model', visionInput, 'Used to classify screenshot frames, so it must read images. Leave empty to use the model above.', !claude),
+    llmRow('Context (tokens)', settingInput('LLM_CONTEXT_TOKENS', values.LLM_CONTEXT_TOKENS, defs.LLM_CONTEXT_TOKENS),
+      'Ollama only. A one-hour lecture transcript is roughly 12k tokens; notes need room on top. Larger needs more memory.', p.protocol === 'ollama'),
+    llmRow('Max output tokens', settingInput('LLM_MAX_OUTPUT_TOKENS', values.LLM_MAX_OUTPUT_TOKENS, defs.LLM_MAX_OUTPUT_TOKENS),
+      claude ? '0 = 64000 for the Anthropic API.' : '0 = the server\'s default.', p.protocol !== 'claude-cli'),
+    llmRow('Timeout (minutes)', settingInput('LLM_TIMEOUT_MINUTES', values.LLM_TIMEOUT_MINUTES, defs.LLM_TIMEOUT_MINUTES),
+      'Per request. Local models can take many minutes on long notes.', p.protocol !== 'claude-cli'),
+    llmRow('Share GPU lock', settingInput('LOCAL_LLM_GPU_LOCK', values.LOCAL_LLM_GPU_LOCK, defs.LOCAL_LLM_GPU_LOCK),
+      'Make the local LLM take turns with Whisper and the vision model on the GPU. Turn off if your GPU has memory for all of them.', !!p.local),
+    p.local ? el('p', { class: 'muted note', textContent: 'Tip: keep CLAUDE_CONCURRENCY and FRAME_CLASSIFY_CONCURRENCY at 1-2 for a local model; it serves one request at a time anyway.' }) : null,
+    datalist,
+  ].filter(Boolean));
+  // Hidden fields still hold their values, so switching providers loses nothing.
+  for (const key of LLM_KEYS) {
+    if (!card.querySelector(`[data-key="${key}"]`)) {
+      const hidden = settingInput(key, values[key], defs[key]);
+      hidden.classList.add('hidden');
+      card.append(hidden);
+    }
+  }
+}
+
+// Password field for the provider's key. Keys are saved separately from settings.json,
+// encrypted for this Windows user.
+function renderKeyControl(p) {
+  const status = llmState.keys[p.keyEnv] || {};
+  const input = el('input', { type: 'password', id: 'llm-key', placeholder: status.saved ? '•••••••• (saved)' : 'Paste the key', autocomplete: 'off' });
+  const msg = el('span', {
+    class: 'muted',
+    textContent: status.saved ? 'Saved (encrypted for this Windows user).'
+      : status.fromWindows ? `Using ${p.keyEnv} from your Windows environment.` : 'Not set.',
+  });
+  const save = el('button', { class: 'small', type: 'button', textContent: 'Save key' });
+  save.addEventListener('click', async () => {
+    if (!input.value.trim()) { msg.textContent = 'Paste a key first.'; return; }
+    const keys = await call(window.api.setKey, p.keyEnv, input.value);
+    if (keys) { llmState.keys = keys; input.value = ''; input.placeholder = '•••••••• (saved)'; msg.textContent = 'Saved (encrypted for this Windows user).'; }
+  });
+  const clear = el('button', { class: 'small', type: 'button', textContent: 'Remove', disabled: !status.saved });
+  clear.addEventListener('click', async () => {
+    const keys = await call(window.api.setKey, p.keyEnv, '');
+    if (keys) { llmState.keys = keys; input.placeholder = 'Paste the key'; clear.disabled = true; msg.textContent = keys[p.keyEnv]?.fromWindows ? `Using ${p.keyEnv} from your Windows environment.` : 'Removed.'; }
+  });
+  return el('div', {},
+    el('div', { class: 'inline' }, input, save, clear),
+    el('span', { class: 'help' }, msg, ` Stored outside settings.json and passed to the pipeline as ${p.keyEnv}.`));
+}
+
 function readSettingsForm() {
   const values = {};
-  for (const input of $('settings-form').querySelectorAll('input')) {
-    const def = state.settings.defaults[input.dataset.key];
-    if (typeof def === 'boolean') values[input.dataset.key] = input.checked;
+  for (const input of $('tab-settings').querySelectorAll('[data-key]')) {
+    const key = input.dataset.key;
+    const def = state.settings.defaults[key];
+    if (typeof def === 'boolean') values[key] = input.checked;
     else if (typeof def === 'number') {
       const n = Number(input.value);
-      if (!Number.isFinite(n)) throw new Error(`${input.dataset.key} must be a number`);
-      values[input.dataset.key] = n;
-    } else values[input.dataset.key] = input.value.trim();
+      if (!Number.isFinite(n)) throw new Error(`${key} must be a number`);
+      values[key] = n;
+    } else values[key] = input.value.trim();
   }
   return values;
 }
@@ -415,6 +542,9 @@ async function saveSettings() {
   if (await call(window.api.saveSettings, values)) {
     $('settings-msg').textContent = 'Saved. Applies to the next run (and to node process.js).';
     state.settings.values = values;
+    // The header badges and Dependencies tab reflect the provider; refresh them.
+    depsState.results = null;
+    refreshInfo();
   }
 }
 
@@ -601,13 +731,15 @@ async function refreshInfo() {
     $('start').disabled = true;
   } else {
     hideBanner();
-    await loadSettings();
+    if (!state.settings) await loadSettings();
   }
 }
 
 async function chooseRoot() {
   const res = await call(window.api.chooseRoot);
   if (res?.error) showBanner(res.error, { label: 'Choose…', fn: chooseRoot });
+  state.settings = null; // the new folder has its own settings.json
+  depsState.results = null;
   await refreshInfo();
   renderRunStatus();
 }
@@ -638,7 +770,7 @@ function init() {
 
   $('deps-check').addEventListener('click', checkDeps);
   $('deps-test-gpu').addEventListener('click', () => runDepTest('gpu', $('deps-test-gpu')));
-  $('deps-test-claude').addEventListener('click', () => runDepTest('claude', $('deps-test-claude')));
+  $('deps-test-llm').addEventListener('click', () => runDepTest('llm', $('deps-test-llm')));
   $('deps-terminal').addEventListener('click', () => call(window.api.openTerminal));
   $('models-load').addEventListener('click', loadModels);
   $('models-english').addEventListener('change', renderModels);
@@ -670,6 +802,8 @@ function init() {
     }
   }, 1000);
 
+  // Settings don't depend on the (slower) dependency check behind refreshInfo.
+  loadSettings({ quiet: true });
   refreshInfo().then(renderRunStatus);
 }
 

@@ -3,8 +3,7 @@ const path = require('path');
 const { exec, spawn } = require('child_process');
 const { promisify } = require('util');
 const { AsyncLocalStorage, AsyncResource } = require('async_hooks');
-const os = require('os');
-const crypto = require('crypto');
+const { createLlm } = require('./llm');
 const execAsync = promisify(exec);
 
 const EXEC_OPTS = { encoding: 'utf-8', maxBuffer: 1024 * 1024 * 100 };
@@ -16,8 +15,29 @@ const DEFAULT_SETTINGS = {
   // analysis, image placement, DOCX). They cost extra CLI calls; set to false to skip them.
   ENABLE_SCREENSHOTS: true,
 
-  // Claude model used for every CLI call in the pipeline.
+  // Which LLM does the transcript fix, notes, frame classification and screenshot placement:
+  // claude-cli | anthropic | openai | openrouter | ollama | lmstudio | lemonade | custom
+  // (see llm/index.js). The Settings tab has a form for these.
+  LLM_PROVIDER: 'claude-cli',
+
+  // Claude model for the claude-cli and anthropic providers.
   CLAUDE_MODEL: 'claude-haiku-5-5',
+
+  // Other providers: server URL (empty = the preset's default), model, and an optional
+  // separate image-capable model for frame classification (empty = LLM_MODEL).
+  LLM_BASE_URL: '',
+  LLM_MODEL: '',
+  LLM_VISION_MODEL: '',
+
+  // Ollama context window in tokens (it defaults to far less than a lecture transcript),
+  // output cap (0 = the server's default), and the per-request time limit.
+  LLM_CONTEXT_TOKENS: 32768,
+  LLM_MAX_OUTPUT_TOKENS: 0,
+  LLM_TIMEOUT_MINUTES: 30,
+
+  // A local LLM (Ollama, LM Studio, Lemonade) shares the GPU with Whisper and the vision
+  // step; true makes them take turns so they don't run out of GPU memory together.
+  LOCAL_LLM_GPU_LOCK: true,
 
   // Whisper model file in tools/whisper.cpp/models (e.g. ggml-small.en.bin), or a full path.
   // Empty = the most accurate model downloaded. Download others with setup-whisper.ps1 -Model.
@@ -38,12 +58,12 @@ const DEFAULT_SETTINGS = {
 
   // Max concurrent jobs per stage when several videos are queued (folder mode).
   // Whisper runs on the single GPU, so it stays at 1; ffmpeg is cheap CPU work;
-  // the Claude CLI steps are network-bound but share your subscription's usage limits.
+  // CLAUDE_CONCURRENCY limits LLM calls of any provider (use 1-2 for a local LLM).
   AUDIO_CONCURRENCY: 3,
   WHISPER_CONCURRENCY: 1,
   CLAUDE_CONCURRENCY: 4,
 
-  // How many frames to classify with Claude at once. Keeps a lecture video's
+  // How many frames to classify with the LLM at once. Keeps a lecture video's
   // worth of frames from fully serializing while staying under API rate limits.
   FRAME_CLASSIFY_CONCURRENCY: 4,
 
@@ -76,7 +96,7 @@ function loadSettings() {
 
 const settings = loadSettings();
 const {
-  ENABLE_SCREENSHOTS, CLAUDE_MODEL, USE_SUBTITLES, SKIP_FIX_FOR_SUBTITLES,
+  ENABLE_SCREENSHOTS, USE_SUBTITLES, SKIP_FIX_FOR_SUBTITLES, LOCAL_LLM_GPU_LOCK,
   AUDIO_CONCURRENCY, WHISPER_CONCURRENCY, CLAUDE_CONCURRENCY, FRAME_CLASSIFY_CONCURRENCY,
   SCENE_CHANGE_THRESHOLD, SSIM_DUPLICATE_THRESHOLD, PLACEMENT_WINDOW_SECONDS, WHISPER_MODEL,
   VISION_MODEL, VISION_MMPROJ,
@@ -166,24 +186,18 @@ const VIDEO_EXTENSIONS = [
     .map(e => (e.startsWith('.') ? e : `.${e}`)),
 ];
 
-// Runs the claude CLI with a prompt, passed via a temp file + stdin redirect
-// (async child_process.exec doesn't support the `input` option execSync has).
-// `images` is an array of PNG file paths; the CLI reads them with its Read tool.
-async function runClaude(prompt, { images = [] } = {}) {
-  let extraArgs = '';
-  if (images.length > 0) {
-    const dirs = [...new Set(images.map(p => path.dirname(p)))];
-    extraArgs = `${dirs.map(d => `--add-dir "${d}"`).join(' ')} --allowedTools Read`;
-    prompt = `Look at the image${images.length > 1 ? 's' : ''} at ${images.length > 1 ? 'these paths' : 'this path'}: ${images.join(', ')}\n\n${prompt}`;
-  }
-  const tmpFile = path.join(os.tmpdir(), `claude-prompt-${crypto.randomUUID()}.txt`);
-  fs.writeFileSync(tmpFile, prompt, 'utf-8');
-  try {
-    const { stdout } = await execAsync(`claude -p --model ${CLAUDE_MODEL} ${extraArgs} < "${tmpFile}"`, EXEC_OPTS);
-    return stdout.trim();
-  } finally {
-    fs.unlinkSync(tmpFile);
-  }
+// The configured LLM (Claude CLI by default). `llm.name` is used in log lines.
+const llm = createLlm(settings, { log });
+
+// Sends one prompt to the configured LLM. `images` is an array of PNG paths; with images the
+// provider's vision model is used. A local LLM waits for the GPU lock (LOCAL_LLM_GPU_LOCK).
+function runLLM(prompt, { images = [] } = {}) {
+  const call = () => llm.complete(prompt, {
+    images,
+    kind: images.length ? 'vision' : 'text',
+    onProgress: chars => log.debug(`${llm.name}: ${chars.toLocaleString()} characters generated`),
+  });
+  return llm.local && LOCAL_LLM_GPU_LOCK ? whisperLimit(call) : call();
 }
 
 function createLimiter(max) {
@@ -348,7 +362,7 @@ async function filterFrames(framesDir) {
   // Drop near-duplicates before paying for a Claude call on each frame.
   const frames = await dedupeFrames(framesDir, allFrames);
 
-  log.info(`[filter] Classifying ${frames.length} unique candidate frame(s) with Claude (${FRAME_CLASSIFY_CONCURRENCY} at a time)...`);
+  log.info(`[filter] Classifying ${frames.length} unique candidate frame(s) with ${llm.name} (${FRAME_CLASSIFY_CONCURRENCY} at a time)...`);
 
   let classified = 0;
   const keptFlags = await mapWithConcurrency(frames, FRAME_CLASSIFY_CONCURRENCY, async (frameFile) => {
@@ -372,10 +386,13 @@ Line 2: if USEFUL, a short caption (under 15 words) describing what the frame sh
 - DISCARD: the frame is blank, a blurry transition, or just shows a presenter/talking head with no supporting visual.`;
 
     try {
-      const output = await runClaude(prompt, { images: [framePath] });
-      const [verdict, ...rest] = output.split('\n');
-      const useful = /^USEFUL/i.test(verdict.trim());
-      return { useful, caption: rest.join(' ').trim() };
+      const output = await runLLM(prompt, { images: [framePath] });
+      // The first USEFUL/DISCARD wins; the caption is whatever follows that line.
+      const lines = output.split('\n').map(l => l.replace(/[*_`#>]/g, '').trim()).filter(Boolean);
+      const at = lines.findIndex(l => /\b(USEFUL|DISCARD)\b/i.test(l));
+      if (at === -1) throw new Error(`unexpected reply: ${output.slice(0, 80)}`);
+      const useful = /\bUSEFUL\b/i.test(lines[at]) && !/\bDISCARD\b/i.test(lines[at]);
+      return { useful, caption: lines.slice(at + 1).join(' ').replace(/^(line 2|caption)\s*:\s*/i, '').trim() };
     } catch (err) {
       log.error(`Frame classification failed for ${frameFile}:`, err.message);
       return { useful: false, caption: '' };
@@ -403,7 +420,7 @@ Line 2: if USEFUL, a short caption (under 15 words) describing what the frame sh
 }
 
 // Describes the kept frames (and transcribes their on-screen text) with a local vision model
-// via frame_analyze.py. Optional: on any failure the pipeline continues with Claude's captions.
+// via frame_analyze.py. Optional: on any failure the pipeline continues with the LLM's captions.
 async function analyzeFrames(framesDir) {
   log.info(`[analyze] Describing kept frames with the local vision model...`);
   try {
@@ -478,20 +495,20 @@ async function fixTranscript(transcriptPath) {
     return fixedPath;
   }
 
-  log.info(`[fix] Fixing transcript with Claude...`);
+  log.info(`[fix] Fixing transcript with ${llm.name}...`);
   const prompt = `You are correcting a speech-to-text transcript of a computer science lecture or educational video. Fix mis-transcribed technical terms, names, programming concepts, and phrases using context. Preserve the original meaning and structure. Output only the corrected transcript, nothing else.
 
 Transcript to fix:
 ${rawText}`;
 
   try {
-    const output = await runClaude(prompt);
+    const output = await runLLM(prompt);
     if (!output) throw new Error('empty response');
     writeFileAtomic(fixedPath, output);
     log.info(`✓ Fixed transcript saved: ${fixedPath}`);
     return fixedPath;
   } catch (err) {
-    throw new Error(`Claude CLI failed (transcript fix): ${err.message}`);
+    throw new Error(`${llm.name} failed (transcript fix): ${err.message}`);
   }
 }
 
@@ -507,7 +524,7 @@ async function generateNotes(fixedTranscriptPath, prefix = '01') {
   const baseName = path.basename(fixedTranscriptPath, path.extname(fixedTranscriptPath)).replace('.raw', '');
   const outputDir = path.dirname(fixedTranscriptPath);
 
-  log.info(`[notes] Generating study notes with Claude...`);
+  log.info(`[notes] Generating study notes with ${llm.name}...`);
   const prompt = `This is a non-interactive, one-shot generation — you cannot ask clarifying questions or present options. If you're torn between two approaches (e.g., how deep to go on a topic), always choose the more thorough, more explanatory one. When supplementing with outside knowledge beyond what the video said, label it clearly (e.g., under "Additional context" or inline as "(not covered in the video:)") so the reader can tell what's the video's framing vs. your addition. Further the goal is to create detailed, self-contained markdown study notes from this computer science video transcript. The reader should be able to fully understand and learn the material WITHOUT watching the video — treat this as writing the explanation the video should have given, not just summarizing what was said.
 
 Start with:
@@ -538,7 +555,7 @@ Transcript from video:
 ${fixedText}`;
 
   try {
-    const notesOutput = await runClaude(prompt);
+    const notesOutput = await runLLM(prompt);
     if (!notesOutput) throw new Error('empty response');
 
     // Extract title from the markdown (first # heading)
@@ -573,7 +590,7 @@ ${fixedText}`;
 
     return finalPath;
   } catch (err) {
-    throw new Error(`Claude CLI failed (notes): ${err.message}`);
+    throw new Error(`${llm.name} failed (notes): ${err.message}`);
   }
 }
 
@@ -653,9 +670,9 @@ ${notesContent}`;
   let finalMarkdown = notesContent;
   if (chosen.length > 0) {
     try {
-      finalMarkdown = await runClaude(prompt);
+      finalMarkdown = await runLLM(prompt);
     } catch (err) {
-      log.error('Claude CLI failed to insert screenshots, appending them at the end:', err.message);
+      log.error(`${llm.name} failed to insert screenshots, appending them at the end:`, err.message);
       finalMarkdown = notesContent;
     }
 
@@ -917,7 +934,7 @@ function worker() {
   send({ type: 'ready', settings });
 }
 
-module.exports = { run, resetVideo, findVideos, findSubtitle, DEFAULT_SETTINGS, SETTINGS_PATH, VIDEO_EXTENSIONS };
+module.exports = { run, resetVideo, findVideos, findSubtitle, loadSettings, DEFAULT_SETTINGS, SETTINGS_PATH, VIDEO_EXTENSIONS };
 
 if (require.main === module) {
   if (WORKER_MODE) worker();

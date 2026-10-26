@@ -179,3 +179,19 @@ code { font-family: var(--mono); font-size: 12px; background: var(--panel-2); pa
 .models tr.family-start td { border-top: 1px solid var(--muted); }
 .check.warn { background: rgba(224, 168, 58, 0.15); color: var(--warn); }
 .check.off { background: var(--panel-2); color: var(--muted); }
+
+/* ---------- Settings: LLM provider card ---------- */
+.settings-scroll { flex: 1; overflow: auto; }
+.settings-scroll .settings { overflow: visible; }
+.settings-heading { font-size: 15px; margin: 18px 20px 6px; }
+.llm-card { margin: 4px 20px 8px; padding: 4px 16px 14px; max-width: 1000px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+.llm-card .settings-heading { margin: 12px 0 4px; }
+.llm-card > p { margin: 0 0 10px; }
+.llm-card .note { margin-top: 10px; font-size: 12px; }
+.llm-row { display: grid; grid-template-columns: minmax(160px, 200px) 1fr; gap: 6px 16px; padding: 6px 0; }
+.llm-row > label { padding-top: 6px; color: var(--muted); }
+.llm-row .field { display: flex; flex-direction: column; gap: 4px; }
+.llm-row input[type=text], .llm-row input[type=number], .llm-row input[type=password], .llm-row select { width: 340px; max-width: 100%; }
+.llm-row input[type=checkbox] { width: 16px; height: 16px; margin-top: 6px; }
+.inline { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.help { color: var(--muted); font-size: 12px; }

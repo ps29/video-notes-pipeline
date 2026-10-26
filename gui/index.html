@@ -76,7 +76,7 @@
           <div class="deps-actions">
             <button id="deps-check" class="primary">Check again</button>
             <button id="deps-test-gpu" title="Transcribes an 11-second sample with whisper.cpp and reports whether the GPU was used">Test GPU</button>
-            <button id="deps-test-claude" title="Sends one short request with the model set in Settings">Test Claude login</button>
+            <button id="deps-test-llm" title="Sends one short prompt to the LLM provider set in Settings (a billed request for paid APIs)">Test LLM</button>
             <button id="deps-terminal" title="Opens PowerShell in the pipeline folder, where the install commands should be run">Open PowerShell here</button>
             <span id="deps-summary" class="muted"></span>
           </div>
@@ -114,7 +114,11 @@
     </section>
 
     <section id="tab-settings" class="tab-panel hidden">
-      <form id="settings-form" class="settings"></form>
+      <div class="settings-scroll">
+        <section id="llm-card" class="llm-card"></section>
+        <h2 class="settings-heading">Pipeline</h2>
+        <form id="settings-form" class="settings"></form>
+      </div>
       <div class="settings-actions">
         <button id="settings-save" class="primary">Save</button>
         <button id="settings-defaults">Restore defaults</button>
