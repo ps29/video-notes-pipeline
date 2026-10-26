@@ -514,6 +514,7 @@ function createWindow() {
     height: 860,
     minWidth: 900,
     minHeight: 600,
+    show: false,
     title: 'Video Notes',
     backgroundColor: '#14161a',
     autoHideMenuBar: true,
@@ -525,6 +526,19 @@ function createWindow() {
     },
   });
   win.loadFile(path.join(__dirname, 'index.html'));
+
+  win.on('ready-to-show', () => {
+    win.show();
+  });
+
+  win.webContents.on('crashed', () => {
+    console.error('FATAL: webContents crashed');
+    process.exit(1);
+  });
+
+  win.on('unresponsive', () => {
+    console.error('WARNING: window unresponsive');
+  });
 
   win.on('close', e => {
     if (!worker) return;
@@ -546,6 +560,22 @@ app.whenReady().then(() => {
   openSetupOnStart = takeFirstRunSetup();
   registerIpc();
   createWindow();
+}).catch(err => {
+  console.error('FATAL ERROR in app.whenReady:', err);
+  process.exit(1);
 });
 
-app.on('window-all-closed', () => app.quit());
+app.on('window-all-closed', () => {
+  console.error('DEBUG: window-all-closed event');
+  app.quit();
+});
+
+process.on('uncaughtException', err => {
+  console.error('FATAL UNCAUGHT EXCEPTION:', err);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('UNHANDLED REJECTION:', reason);
+  process.exit(1);
+});
