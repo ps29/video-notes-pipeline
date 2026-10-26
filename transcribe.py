@@ -18,15 +18,30 @@ WHISPER_CLI = os.path.join(ROOT, "tools", "whisper.cpp", "build", "bin", "Releas
 MODELS_DIR = os.path.join(ROOT, "tools", "whisper.cpp", "models")
 
 
+# Accuracy order of the whisper.cpp model families, least to most accurate.
+FAMILIES = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3-turbo", "large-v3"]
+
+
+def model_rank(name):
+    """Sort key for ggml-<family>[.en][-qN_M].bin: bigger family first, then English-only
+    (better for English lectures), then full precision over q8 over q5. None if unrecognized."""
+    import re
+    m = re.match(r"^ggml-([a-z0-9-]+?)(\.en)?(?:-q(\d)_\d)?\.bin$", name)
+    if not m or m.group(1) not in FAMILIES:
+        return None
+    return (FAMILIES.index(m.group(1)), bool(m.group(2)), int(m.group(3) or 99))
+
+
 def find_model():
-    """WHISPER_MODEL (a path) if set, else the most accurate ggml model downloaded."""
+    """WHISPER_MODEL if set (a path, or a file name in MODELS_DIR), else the most accurate
+    ggml model downloaded."""
     override = os.environ.get("WHISPER_MODEL")
     if override:
-        return override
-    for name in ("medium.en", "small.en", "base.en", "medium", "small", "base"):
-        path = os.path.join(MODELS_DIR, f"ggml-{name}.bin")
-        if os.path.exists(path):
-            return path
+        return override if os.path.dirname(override) else os.path.join(MODELS_DIR, override)
+    if os.path.isdir(MODELS_DIR):
+        ranked = sorted((r, n) for n in os.listdir(MODELS_DIR) if (r := model_rank(n)) is not None)
+        if ranked:
+            return os.path.join(MODELS_DIR, ranked[-1][1])
     return os.path.join(MODELS_DIR, "ggml-small.en.bin")  # not present; reported by the caller
 
 
@@ -39,11 +54,11 @@ def transcribe_whisper_cpp(audio_path):
         out_base = os.path.join(tmp, "out")
         result = subprocess.run(
             [WHISPER_CLI, "-m", MODEL, "-f", audio_path, "-l", "en",
-             "-oj", "-of", out_base, "-np"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+             "-oj", "-of", out_base, "-pp"],
+            # stderr passes through so callers (the GUI log) see whisper.cpp's progress
+            stdout=subprocess.DEVNULL,
         )
         if result.returncode != 0:
-            print(result.stderr, file=sys.stderr)
             sys.exit(result.returncode)
         with open(out_base + ".json", encoding="utf-8") as f:
             data = json.load(f)
@@ -81,10 +96,33 @@ def pick_backend():
     return "faster-whisper"
 
 
+def check():
+    """Prints, as JSON, which backend and model a transcription would use (for deps-check.js)."""
+    import importlib.util
+    models = []
+    if os.path.isdir(MODELS_DIR):
+        models = [{"name": n, "size": os.path.getsize(os.path.join(MODELS_DIR, n))}
+                  for n in sorted(os.listdir(MODELS_DIR)) if n.startswith("ggml-") and n.endswith(".bin")]
+    print(json.dumps({
+        "backend": pick_backend(),
+        "whisper_cli": WHISPER_CLI,
+        "whisper_cli_exists": os.path.exists(WHISPER_CLI),
+        "model": MODEL,
+        "model_exists": os.path.exists(MODEL),
+        "models_dir": MODELS_DIR,
+        "models": models,
+        "faster_whisper": importlib.util.find_spec("faster_whisper") is not None,
+    }))
+
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python transcribe.py <audio-file>", file=sys.stderr)
+        print("Usage: python transcribe.py <audio-file> | --check", file=sys.stderr)
         sys.exit(1)
+
+    if sys.argv[1] == "--check":
+        check()
+        return
 
     audio_path = sys.argv[1]
 

@@ -1,0 +1,465 @@
+// Checks the pipeline's external dependencies and explains how to install anything missing.
+// Nothing is installed: this only looks, and runs version commands.
+//
+//   node deps-check.js            table of results + install instructions
+//   node deps-check.js --deep     also run the GPU test and an LLM test (one short prompt)
+//   node deps-check.js --models   also list Whisper/vision models from Hugging Face
+//   node deps-check.js --json     machine-readable output (used by CI)
+//
+// The GUI's Dependencies tab calls checkAll / deepTests / fetchModels directly.
+
+const fs = require('fs');
+const path = require('path');
+const { execFile } = require('child_process');
+
+const ROOT = __dirname;
+const VENV_PYTHON = path.join(ROOT, '.venv', 'Scripts', 'python.exe');
+
+// When each dependency is needed. "always" ones are reported as blockers before a run.
+const NEED = {
+  always: 'Every run',
+  screenshots: 'Runs with screenshots on',
+  noSubtitles: 'Videos without .srt subtitles',
+  optional: 'Optional',
+};
+
+// ---------- process helpers (never throw) ----------
+
+function run(cmd, args, { timeout = 15000, input, env } = {}) {
+  return new Promise(resolve => {
+    // .cmd/.bat shims (npm-installed CLIs) need a shell on Windows.
+    const shell = /\.(cmd|bat)$/i.test(cmd);
+    const quoted = shell ? [`"${cmd}"`, ...args.map(a => `"${a}"`)] : [cmd, ...args];
+    const child = execFile(quoted[0], quoted.slice(1), { timeout, env, windowsHide: true, shell, encoding: 'utf-8', maxBuffer: 16 * 1024 * 1024 },
+      (err, stdout, stderr) => resolve({ ok: !err, code: err ? (err.code ?? 1) : 0, stdout: stdout || '', stderr: stderr || '', error: err }));
+    if (input !== undefined) child.stdin.end(input);
+  });
+}
+
+// First match on PATH (where.exe), or null.
+async function locate(name) {
+  const res = await run('where', [name], { timeout: 5000 });
+  return res.ok ? res.stdout.split(/\r?\n/)[0].trim() || null : null;
+}
+
+const firstLine = s => (s || '').split(/\r?\n/).find(l => l.trim()) || '';
+
+function loadSettings() {
+  try {
+    const { DEFAULT_SETTINGS, SETTINGS_PATH } = require('./process.js');
+    let saved = {};
+    try { saved = JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf-8')); } catch { /* defaults */ }
+    return { ...DEFAULT_SETTINGS, ...saved };
+  } catch {
+    return { ENABLE_SCREENSHOTS: true, CLAUDE_MODEL: 'claude-haiku-5-5' };
+  }
+}
+
+async function pythonJson(script, env = {}) {
+  if (!fs.existsSync(VENV_PYTHON)) return null;
+  const res = await run(VENV_PYTHON, [path.join(ROOT, script), '--check'], { timeout: 20000, env: { ...process.env, ...env } });
+  try { return JSON.parse(res.stdout); } catch { return null; }
+}
+
+// ---------- individual checks ----------
+// Each returns { id, name, purpose, neededFor, need, status, version, path, detail, install }.
+// status: ok | missing | warn | off. install: [{ label, command?, url?, note?, action? }].
+//
+// `action` makes an option runnable from the app's setup assistant (gui/main.js runs it in a
+// visible PowerShell window in the pipeline folder, after the user confirms):
+//   { steps: [step...], admin?: true, heavy?: true }
+//   step: { winget: '<package id>', exe?: '<skip if this command exists>' }
+//       | { run: '<PowerShell command>' } | { script: '<.ps1 in the pipeline folder>' }
+// `command` is the same thing as text, for copying and for the confirmation dialog.
+const winget = (id, exe) => ({
+  command: `winget install --id ${id} -e`,
+  action: { steps: [{ winget: id, ...(exe ? { exe } : {}) }] },
+});
+
+async function checkTool({ id, name, exe, versionArgs, parseVersion, purpose, need, install }) {
+  const found = await locate(exe);
+  const base = { id, name, purpose, need, neededFor: NEED[need], install };
+  if (!found) return { ...base, status: 'missing', detail: `${exe} was not found on PATH.` };
+  const res = await run(found, versionArgs);
+  if (!res.ok) return { ...base, status: 'warn', path: found, detail: `Found, but "${exe} ${versionArgs.join(' ')}" failed: ${firstLine(res.stderr || res.error?.message)}` };
+  return { ...base, status: 'ok', path: found, version: parseVersion(res.stdout || res.stderr) };
+}
+
+const checkFfmpeg = () => checkTool({
+  id: 'ffmpeg', name: 'ffmpeg', exe: 'ffmpeg', versionArgs: ['-version'],
+  parseVersion: out => firstLine(out).match(/version (\S+)/)?.[1] || firstLine(out),
+  purpose: 'Extracts audio for Whisper and candidate frames for screenshots.',
+  need: 'always',
+  install: [
+    { label: 'winget', ...winget('Gyan.FFmpeg', 'ffmpeg') },
+    { label: 'Download', url: 'https://www.gyan.dev/ffmpeg/builds/', note: 'Unzip and add its bin folder to PATH.' },
+  ],
+});
+
+const checkPandoc = settings => checkTool({
+  id: 'pandoc', name: 'pandoc', exe: 'pandoc', versionArgs: ['--version'],
+  parseVersion: out => firstLine(out).replace(/^pandoc(\.exe)?\s*/i, ''),
+  purpose: 'Converts the notes with screenshots into the .docx file.',
+  need: 'screenshots',
+  install: [
+    { label: 'winget', ...winget('JohnMacFarlane.Pandoc', 'pandoc') },
+    { label: 'Download', url: 'https://pandoc.org/installing.html' },
+  ],
+}).then(r => (settings.ENABLE_SCREENSHOTS || r.status === 'ok' ? r : { ...r, status: 'off', detail: 'Not needed: screenshots are turned off in Settings.' }));
+
+// Only needed when the LLM provider is the Claude CLI (the default).
+const checkClaude = settings => {
+  const inUse = (settings.LLM_PROVIDER || 'claude-cli') === 'claude-cli';
+  return checkTool({
+    id: 'claude', name: 'Claude CLI', exe: 'claude', versionArgs: ['--version'],
+    parseVersion: out => firstLine(out),
+    purpose: 'Fixes transcripts, writes the notes, and classifies and places screenshots (when the LLM provider is "Claude CLI").',
+    need: inUse ? 'always' : 'optional',
+    install: [
+      { label: 'winget', ...winget('Anthropic.ClaudeCode', 'claude'), note: 'Then log in (next row). Use "Test LLM" here to confirm.' },
+      { label: 'Log in', command: 'claude', action: { steps: [{ run: 'claude' }] }, note: 'Starts Claude Code in the window; follow the login prompt (or type /login), then /exit.' },
+      { label: 'Docs', url: 'https://code.claude.com/docs/en/setup' },
+    ],
+  }).then(r => (inUse || r.status === 'ok' ? r : { ...r, status: 'off', detail: `Not needed: the LLM provider is ${settings.LLM_PROVIDER}.` }));
+};
+
+// Setup hints per LLM provider preset (see llm/index.js).
+const LLM_INSTALL = {
+  'claude-cli': [{ label: 'Note', note: 'Uses the Claude CLI above.' }],
+  anthropic: [
+    { label: 'API key', url: 'https://platform.claude.com/settings/keys', note: 'Create a key, then paste it in Settings → LLM provider (or set ANTHROPIC_API_KEY).' },
+    { label: 'SDK', command: 'npm install', note: 'Run in the pipeline folder if the Anthropic SDK is reported missing.' },
+  ],
+  openai: [{ label: 'API key', url: 'https://platform.openai.com/api-keys', note: 'Paste it in Settings → LLM provider (or set OPENAI_API_KEY).' }],
+  openrouter: [{ label: 'API key', url: 'https://openrouter.ai/keys', note: 'Paste it in Settings → LLM provider (or set OPENROUTER_API_KEY).' }],
+  ollama: [
+    { label: 'winget', ...winget('Ollama.Ollama', 'ollama') },
+    { label: 'Download', url: 'https://ollama.com/download' },
+    { label: 'Get a model', command: 'ollama pull <model>', note: 'Pick a model at ollama.com/library. Frame classification needs one that reads images (ollama.com/search?c=vision); set it as the vision model.' },
+  ],
+  lmstudio: [
+    { label: 'winget', ...winget('ElementLabs.LMStudio') },
+    { label: 'Download', url: 'https://lmstudio.ai/download' },
+    { label: 'Start server', command: 'lms server start', action: { steps: [{ run: '& "$env:USERPROFILE\\.lmstudio\\bin\\lms.exe" server start' }] }, note: 'Load a model with a context length of 32k or more (lms load <model> --context-length 32768). If "Require authentication" is on, add LM Studio\'s API token in Settings.' },
+    { label: 'Auth docs', url: 'https://lmstudio.ai/docs/developer/core/authentication' },
+  ],
+  lemonade: [{ label: 'Install', url: 'https://lemonade-server.ai/', note: 'Start Lemonade and load a model, then pick it in Settings → LLM provider.' }],
+  custom: [{ label: 'Note', note: 'Point the base URL at the server\'s OpenAI-compatible /v1 address and choose a model.' }],
+};
+
+// Checks that the configured provider answers and has the configured models. Lists models
+// only (no tokens used); "Test LLM" sends a real prompt.
+async function checkLlm(settings) {
+  const { createLlm, PROVIDERS } = require('./llm');
+  const llm = createLlm(settings);
+  const { config } = llm;
+  const pulls = config.protocol === 'ollama' ? [...new Set([config.model, config.visionModel].filter(Boolean))] : [];
+  const base = {
+    id: 'llm', name: `LLM: ${config.label}`, need: 'always', neededFor: NEED.always,
+    purpose: 'Fixes transcripts, writes the notes, and classifies and places screenshots. Choose the provider in Settings → LLM provider.',
+    install: [
+      ...(LLM_INSTALL[config.id] || []),
+      ...(pulls.length ? [{
+        label: 'Pull configured model', command: pulls.map(m => `ollama pull ${m}`).join('; '),
+        action: { steps: pulls.map(m => ({ run: `ollama pull ${m}` })) },
+        note: 'Downloads the model(s) set in Settings into Ollama.',
+      }] : []),
+    ],
+  };
+  if (config.protocol === 'claude-cli') {
+    return { ...base, status: 'ok', version: config.model, detail: 'Uses the Claude CLI (checked separately). Use "Test LLM" to confirm you are logged in.' };
+  }
+  if (!config.model) return { ...base, status: 'missing', detail: 'No model chosen. Pick one in Settings → LLM provider.' };
+  if (config.keyEnv && !config.keyOptional && !config.apiKey) {
+    return { ...base, status: 'missing', detail: `No API key: add one in Settings → LLM provider, or set ${config.keyEnv}.` };
+  }
+  let models;
+  try {
+    models = await llm.listModels();
+  } catch (err) {
+    return { ...base, status: 'missing', path: config.baseUrl || undefined, detail: err.message };
+  }
+  const ids = new Set(models.map(m => m.id));
+  const wanted = [...new Set([config.model, settings.ENABLE_SCREENSHOTS ? config.visionModel : null].filter(Boolean))];
+  const absent = ids.size ? wanted.filter(m => !ids.has(m)) : [];
+  const version = config.visionModel !== config.model ? `${config.model} · vision: ${config.visionModel}` : config.model;
+  if (absent.length) {
+    const sample = [...ids].slice(0, 8).join(', ');
+    return { ...base, status: 'warn', version, path: config.baseUrl || undefined, detail: `The server answered, but doesn't list ${absent.join(' or ')}. Available: ${sample}${ids.size > 8 ? ', ...' : ''}` };
+  }
+  const local = PROVIDERS[config.id]?.local;
+  return {
+    ...base, status: 'ok', version, path: config.baseUrl || undefined,
+    detail: `${models.length} model(s) available.${local ? ' Runs on this PC: keep CLAUDE_CONCURRENCY at 1-2.' : ''} Use "Test LLM" to send a short prompt.`,
+  };
+}
+
+async function checkPython() {
+  const base = {
+    id: 'python', name: 'Python (.venv)', need: 'noSubtitles', neededFor: `${NEED.noSubtitles}; vision step`,
+    purpose: 'Runs transcribe.py (Whisper) and frame_analyze.py (vision). Expected at .venv\\Scripts\\python.exe in the pipeline folder.',
+    install: [
+      {
+        label: 'uv (recommended)', command: 'winget install --id astral-sh.uv -e; uv sync',
+        action: { steps: [{ winget: 'astral-sh.uv', exe: 'uv' }, { run: 'uv sync' }] },
+        note: 'Installs uv if needed, then creates .venv in the pipeline folder from pyproject.toml/uv.lock (uv fetches Python 3.13 itself, about 300 MB with faster-whisper).',
+      },
+      { label: 'Python + venv', command: 'winget install --id Python.Python.3.13 -e; py -3.13 -m venv .venv', note: 'Run in the pipeline folder.' },
+      { label: 'Get uv', url: 'https://docs.astral.sh/uv/getting-started/installation/' },
+    ],
+  };
+  if (!fs.existsSync(VENV_PYTHON)) return { ...base, status: 'missing', detail: `${VENV_PYTHON} does not exist.` };
+  const res = await run(VENV_PYTHON, ['--version']);
+  const version = firstLine(res.stdout || res.stderr).replace(/^Python\s*/, '');
+  if (!res.ok) return { ...base, status: 'warn', path: VENV_PYTHON, detail: 'The .venv exists but Python failed to start. Recreate it.' };
+  const wanted = '3.13';
+  return {
+    ...base, path: VENV_PYTHON, version,
+    status: version.startsWith(wanted) ? 'ok' : 'warn',
+    detail: version.startsWith(wanted) ? undefined : `pyproject.toml asks for Python ${wanted}.x; the helpers will probably still work.`,
+  };
+}
+
+// Same environment process.js gives transcribe.py, so the check reports the model a run would use.
+const whisperEnv = settings => (settings.WHISPER_MODEL ? { WHISPER_MODEL: settings.WHISPER_MODEL } : {});
+const visionEnv = settings => ({
+  ...(settings.VISION_MODEL ? { VLM_MODEL: settings.VISION_MODEL } : {}),
+  ...(settings.VISION_MMPROJ ? { VLM_MMPROJ: settings.VISION_MMPROJ } : {}),
+});
+
+async function checkWhisper(settings) {
+  const base = {
+    id: 'whisper', name: 'Whisper (transcription)', need: 'noSubtitles', neededFor: NEED.noSubtitles,
+    purpose: 'Transcribes the audio. whisper.cpp on the GPU (Vulkan) is preferred; faster-whisper on the CPU is the fallback.',
+    install: [
+      { label: 'whisper.cpp (GPU)', command: '.\\setup-whisper.ps1', action: { steps: [{ script: 'setup-whisper.ps1' }], admin: true, heavy: true }, note: 'Run in PowerShell in the pipeline folder. Installs build tools (~6 GB) and builds whisper.cpp. Add -Model <name> to pick a model (see Models below).' },
+      { label: 'faster-whisper (CPU)', command: '.\\.venv\\Scripts\\python.exe -m pip install faster-whisper', note: 'No build needed, but slower.' },
+    ],
+  };
+  const info = await pythonJson('transcribe.py', whisperEnv(settings));
+  if (!info) return { ...base, status: 'missing', detail: 'Needs the Python .venv first (see above).' };
+  const modelName = path.basename(info.model);
+  const models = info.models.map(m => m.name);
+  const choice = settings.WHISPER_MODEL
+    ? 'Chosen by WHISPER_MODEL in Settings.'
+    : `The most accurate downloaded model is used${models.length > 1 ? ` (downloaded: ${models.join(', ')})` : ''}. Set WHISPER_MODEL in Settings to choose.`;
+  if (info.backend === 'whisper.cpp' && info.whisper_cli_exists && info.model_exists) {
+    return { ...base, status: 'ok', path: info.whisper_cli, version: `whisper.cpp · ${modelName}`, detail: choice, info };
+  }
+  if (info.faster_whisper) {
+    const why = !info.whisper_cli_exists ? 'whisper-cli.exe is not built' : !info.model_exists ? `${modelName} is not downloaded` : 'forced by WHISPER_BACKEND';
+    return { ...base, status: 'warn', version: 'faster-whisper (CPU)', detail: `Using the CPU fallback because ${why}. It works, but it is much slower than the GPU.`, info };
+  }
+  const missing = [!info.whisper_cli_exists && 'whisper-cli.exe', !info.model_exists && modelName].filter(Boolean).join(' and ');
+  return { ...base, status: 'missing', detail: `No backend: ${missing} missing, and faster-whisper is not installed.`, info };
+}
+
+async function checkVulkan() {
+  const dll = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'vulkan-1.dll');
+  const base = {
+    id: 'vulkan', name: 'Vulkan runtime (GPU)', need: 'optional', neededFor: 'GPU speed for Whisper and llama.cpp',
+    purpose: 'Lets whisper.cpp and llama.cpp use the GPU. It ships with GPU drivers.',
+    install: [
+      { label: 'AMD drivers', url: 'https://www.amd.com/en/support/download/drivers.html' },
+      { label: 'Note', note: 'For NVIDIA or Intel GPUs, install the vendor\'s current driver. Use "Test GPU" here to confirm Whisper uses it.' },
+    ],
+  };
+  return fs.existsSync(dll)
+    ? { ...base, status: 'ok', path: dll }
+    : { ...base, status: 'warn', detail: 'vulkan-1.dll not found: transcription will run on the CPU.' };
+}
+
+async function checkVision(settings) {
+  const base = {
+    id: 'vision', name: 'Vision model (screenshots)', need: 'optional', neededFor: 'Screenshot descriptions (optional)',
+    purpose: 'Describes each kept screenshot and reads its on-screen text, which helps place images. Without it, the pipeline uses Claude\'s short captions.',
+    install: [
+      { label: 'Lemonade Server', url: 'https://lemonade-server.ai/', note: 'Start it, then load the vision model it lists. The pipeline uses it automatically when it is running.' },
+      { label: 'llama.cpp', command: '.\\setup-llama.ps1', action: { steps: [{ script: 'setup-llama.ps1' }], admin: true, heavy: true }, note: 'Run in PowerShell in the pipeline folder. Builds llama-server and downloads Qwen2.5-VL-3B (~3 GB).' },
+    ],
+  };
+  if (!settings.ENABLE_SCREENSHOTS) return { ...base, status: 'off', detail: 'Not needed: screenshots are turned off in Settings.' };
+  const info = await pythonJson('frame_analyze.py', visionEnv(settings));
+  if (!info) return { ...base, status: 'warn', detail: 'Needs the Python .venv first (see above).' };
+  if (info.lemonade_up) return { ...base, status: 'ok', version: `Lemonade · ${info.lemonade_model}`, path: info.lemonade_url, info };
+  if (info.llama_server_exists && info.model_exists && info.mmproj_exists) {
+    return { ...base, status: 'ok', version: `llama.cpp · ${path.basename(info.model)}`, path: info.llama_server, detail: 'Lemonade is not running, so llama-server is started when needed.', info };
+  }
+  const missing = [!info.llama_server_exists && 'llama-server.exe', !info.model_exists && path.basename(info.model), !info.mmproj_exists && path.basename(info.mmproj)].filter(Boolean);
+  return { ...base, status: 'warn', detail: `Not set up: Lemonade is not running at ${info.lemonade_url}, and ${missing.join(', ')} ${missing.length > 1 ? 'are' : 'is'} missing. Runs continue without it.`, info };
+}
+
+// Runs every quick check (version commands only; no network, no Claude requests).
+async function checkAll() {
+  const settings = loadSettings();
+  const results = await Promise.all([
+    checkFfmpeg(), checkPandoc(settings), checkLlm(settings), checkClaude(settings), checkPython(), checkWhisper(settings), checkVulkan(), checkVision(settings),
+  ]);
+  return { root: ROOT, checkedAt: new Date().toISOString(), settings: { ENABLE_SCREENSHOTS: settings.ENABLE_SCREENSHOTS, LLM_PROVIDER: settings.LLM_PROVIDER, CLAUDE_MODEL: settings.CLAUDE_MODEL, LLM_MODEL: settings.LLM_MODEL, WHISPER_MODEL: settings.WHISPER_MODEL }, results };
+}
+
+// ---------- deep tests (slower; the Claude one makes a real request) ----------
+
+async function testGpu() {
+  const info = await pythonJson('transcribe.py', whisperEnv(loadSettings()));
+  const sample = path.join(ROOT, 'tools', 'whisper.cpp', 'samples', 'jfk.wav');
+  const base = { id: 'gpu-test', name: 'GPU test (Whisper)' };
+  if (!info || !info.whisper_cli_exists || !info.model_exists) return { ...base, status: 'missing', detail: 'whisper.cpp is not set up, so there is nothing to test.' };
+  if (!fs.existsSync(sample)) return { ...base, status: 'warn', detail: `Sample audio not found: ${sample}` };
+  const started = Date.now();
+  const res = await run(info.whisper_cli, ['-m', info.model, '-f', sample, '-nt'], { timeout: 180000 });
+  const out = `${res.stdout}\n${res.stderr}`;
+  const seconds = ((Date.now() - started) / 1000).toFixed(1);
+  const text = firstLine(res.stdout).trim();
+  if (!res.ok) return { ...base, status: 'missing', detail: `whisper-cli failed: ${firstLine(res.stderr)}` };
+  const gpu = out.match(/using (Vulkan\d*) backend/);
+  return gpu
+    ? { ...base, status: 'ok', version: gpu[1], detail: `Transcribed the 11 s sample in ${seconds} s on the GPU: "${text}"` }
+    : { ...base, status: 'warn', detail: `Worked, but on the CPU (${seconds} s). Update the GPU driver to use Vulkan.` };
+}
+
+// Sends one short prompt through the configured provider (a real, billed request for paid APIs).
+async function testLlm() {
+  const settings = loadSettings();
+  const { createLlm } = require('./llm');
+  const llm = createLlm(settings);
+  const base = { id: 'llm-test', name: `LLM test (${llm.config.label})` };
+  const started = Date.now();
+  try {
+    const reply = await llm.complete('Reply with exactly: OK');
+    const seconds = ((Date.now() - started) / 1000).toFixed(1);
+    return /\bOK\b/i.test(reply)
+      ? { ...base, status: 'ok', version: llm.config.model, detail: `The model answered in ${seconds} s.` }
+      : { ...base, status: 'warn', version: llm.config.model, detail: `The model answered in ${seconds} s, but not as asked: "${reply.slice(0, 120)}". Small models may struggle with the pipeline's prompts.` };
+  } catch (err) {
+    const hint = llm.config.protocol === 'claude-cli' ? ' Run "claude" in a terminal to log in, and check CLAUDE_MODEL in Settings.' : '';
+    return { ...base, status: 'missing', detail: `${err.message}${hint}` };
+  }
+}
+
+async function deepTests() {
+  return Promise.all([testGpu(), testLlm()]);
+}
+
+// ---------- model lists from Hugging Face (information only) ----------
+
+const HF = 'https://huggingface.co';
+const WHISPER_REPO = 'ggerganov/whisper.cpp';
+// Vision models known to work with llama.cpp's mmproj support. Sizes are fetched live.
+const VISION_REPOS = [
+  'ggml-org/Qwen3-VL-2B-Instruct-GGUF',
+  'ggml-org/Qwen2.5-VL-3B-Instruct-GGUF',
+  'Qwen/Qwen3-VL-4B-Instruct-GGUF',
+  'ggml-org/Qwen2.5-VL-7B-Instruct-GGUF',
+  'Qwen/Qwen3-VL-8B-Instruct-GGUF',
+];
+
+async function hfFiles(repo) {
+  const res = await fetch(`${HF}/api/models/${repo}?blobs=true`, { signal: AbortSignal.timeout(15000) });
+  if (!res.ok) throw new Error(`Hugging Face returned ${res.status} for ${repo}`);
+  const data = await res.json();
+  return data.siblings.map(s => ({ name: s.rfilename, size: s.size, sha256: s.lfs?.sha256, url: `${HF}/${repo}/resolve/main/${s.rfilename}` }));
+}
+
+// Model family and variant from a whisper.cpp file name, e.g. ggml-small.en-q5_1.bin.
+function describeWhisper(name) {
+  const m = name.match(/^ggml-([a-z0-9-]+?)(\.en)?(?:-(q\d_\d))?\.bin$/);
+  if (!m) return null;
+  return { family: m[1], english: !!m[2], quant: m[3] || null };
+}
+
+// Smallest to largest, matching transcribe.py's accuracy order.
+const WHISPER_FAMILIES = ['tiny', 'base', 'small', 'medium', 'large-v1', 'large-v2', 'large-v3-turbo', 'large-v3'];
+
+async function fetchModels() {
+  const local = await pythonJson('transcribe.py', whisperEnv(loadSettings()));
+  const installed = new Set((local?.models || []).map(m => m.name));
+  const inUse = local?.model_exists ? path.basename(local.model) : null;
+  const order = f => [WHISPER_FAMILIES.indexOf(f.family), f.english ? 0 : 1, f.quant ? -Number(f.quant[1]) : -99];
+  const whisper = (await hfFiles(WHISPER_REPO))
+    .filter(f => describeWhisper(f.name) && WHISPER_FAMILIES.includes(describeWhisper(f.name).family))
+    .map(f => ({ ...f, ...describeWhisper(f.name) }))
+    .sort((a, b) => {
+      const [x, y] = [order(a), order(b)];
+      return x[0] - y[0] || x[1] - y[1] || y[2] - x[2];
+    })
+    .map(f => ({
+      ...f,
+      installed: installed.has(f.name),
+      inUse: f.name === inUse,
+      // setup-whisper.ps1 downloads ggml-<Model>.bin
+      command: `.\\setup-whisper.ps1 -Model ${f.name.replace(/^ggml-|\.bin$/g, '')}`,
+    }));
+
+  const visionDir = path.join(ROOT, 'tools', 'models');
+  const localVision = new Set(fs.existsSync(visionDir) ? fs.readdirSync(visionDir) : []);
+  const vision = await Promise.all(VISION_REPOS.map(async repo => {
+    try {
+      const files = (await hfFiles(repo)).filter(f => f.name.endsWith('.gguf'))
+        .map(f => ({ ...f, installed: localVision.has(f.name) }));
+      // A file already in tools/models wins; otherwise the smallest sensible quantization.
+      const pick = re => files.filter(f => re.test(f.name)).sort((a, b) => b.installed - a.installed || a.size - b.size)[0];
+      const have = re => files.find(f => f.installed && re.test(f.name));
+      const model = have(/^(?!mmproj)/i) || pick(/^(?!mmproj).*q4_k_m\.gguf$/i) || pick(/^(?!mmproj).*q8_0\.gguf$/i);
+      const mmproj = have(/^mmproj/i) || pick(/^mmproj.*q8_0\.gguf$/i) || pick(/^mmproj.*\.gguf$/i);
+      return { repo, url: `${HF}/${repo}`, model, mmproj, modelsDir: visionDir };
+    } catch (err) {
+      return { repo, url: `${HF}/${repo}`, error: err.message };
+    }
+  }));
+  const settings = loadSettings();
+  return {
+    whisper, vision, fetchedAt: new Date().toISOString(),
+    visionInUse: { model: settings.VISION_MODEL || '', mmproj: settings.VISION_MMPROJ || '' },
+  };
+}
+
+// ---------- CLI ----------
+
+const ICON = { ok: '✓', warn: '!', missing: '✗', off: '–' };
+const mb = n => (n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${Math.round(n / 1e6)} MB`);
+
+function printResults(results) {
+  for (const r of results) {
+    console.log(`${ICON[r.status] || '?'} ${r.name.padEnd(32)} ${[r.version, r.detail].filter(Boolean).join(' — ')}`);
+  }
+  const todo = results.filter(r => r.install && ['missing', 'warn'].includes(r.status));
+  for (const r of todo) {
+    console.log(`\n${r.name} (${r.neededFor}): ${r.purpose}`);
+    for (const i of r.install) {
+      console.log(`  ${i.label}: ${i.command || i.url || ''}${i.note ? `\n    ${i.note}` : ''}`);
+    }
+  }
+}
+
+async function cli() {
+  const args = new Set(process.argv.slice(2));
+  const report = await checkAll();
+  if (args.has('--deep')) report.deep = await deepTests();
+  if (args.has('--models')) {
+    try { report.models = await fetchModels(); } catch (err) { report.models = { error: err.message }; }
+  }
+
+  if (args.has('--json')) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    console.log(`Pipeline folder: ${report.root}\n`);
+    printResults(report.results);
+    if (report.deep) { console.log(''); printResults(report.deep); }
+    if (report.models?.error) console.log(`\nCould not load models from Hugging Face: ${report.models.error}`);
+    else if (report.models) {
+      console.log('\nWhisper models (Hugging Face, ggerganov/whisper.cpp):');
+      for (const m of report.models.whisper) console.log(`  ${m.installed ? '✓' : ' '} ${m.name.padEnd(34)} ${mb(m.size).padStart(8)}   ${m.command}`);
+      console.log('\nVision models (curated):');
+      for (const v of report.models.vision) {
+        console.log(v.error ? `  ${v.repo}: ${v.error}` : `  ${v.repo.padEnd(42)} ${v.model?.name} (${mb(v.model?.size)}) + ${v.mmproj?.name} (${mb(v.mmproj?.size)})`);
+      }
+    }
+  }
+  // Non-zero only when something every run needs is missing.
+  process.exitCode = report.results.some(r => r.need === 'always' && r.status === 'missing') ? 1 : 0;
+}
+
+module.exports = { checkAll, deepTests, testGpu, testLlm, fetchModels, loadSettings, NEED };
+
+if (require.main === module) cli();

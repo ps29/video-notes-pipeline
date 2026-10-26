@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'feat/**']
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax check (JavaScript)
+        shell: bash
+        run: |
+          for f in process.js deps-check.js gui/*.js llm/*.js; do node --check "$f"; done
+
+      - name: Syntax check (Python)
+        run: python -I -m py_compile transcribe.py frame_analyze.py
+
+      - name: LLM provider tests (mock server)
+        run: npm test
+
+      # Forks process.js the way the GUI does and checks it reports over IPC and ends cleanly
+      # (no ffmpeg/Claude needed: the input path does not exist).
+      - name: Worker smoke test
+        shell: bash
+        run: |
+          node -e "
+            const { fork } = require('child_process');
+            const c = fork('process.js', [], { env: { ...process.env, VIDEO_NOTES_WORKER: '1' } });
+            const seen = [];
+            c.on('message', m => {
+              seen.push(m.type);
+              if (m.type === 'ready') c.send({ cmd: 'start', input: 'does-not-exist' });
+            });
+            c.on('exit', code => {
+              console.log('messages:', seen.join(' '), '| exit', code);
+              const ok = code === 0 && seen[0] === 'ready' && seen.includes('log') && seen.at(-1) === 'end';
+              process.exit(ok ? 0 : 1);
+            });
+          "
+
+      # The runner has none of the tools, so "missing" results are expected; this only checks
+      # that the checker runs and reports every dependency with an install hint.
+      - name: Dependency check
+        shell: bash
+        run: |
+          node deps-check.js --json > deps.json || true
+          node -e "
+            const r = require('./deps.json');
+            const ids = r.results.map(x => x.id);
+            for (const id of ['ffmpeg','pandoc','claude','python','whisper','vulkan','vision']) if (!ids.includes(id)) throw new Error('missing check ' + id);
+            for (const x of r.results) if (!['ok','warn','missing','off'].includes(x.status) || !x.install?.length) throw new Error('bad result ' + x.id);
+            console.log(r.results.map(x => x.id + '=' + x.status).join(' '));
+          "
+          python -I transcribe.py --check
+          python -I frame_analyze.py --check
+
+      - name: Module exports
+        run: node -e "const m = require('./process.js'); for (const k of ['run','resetVideo','DEFAULT_SETTINGS','VIDEO_EXTENSIONS']) if (!(k in m)) throw new Error('missing export ' + k); console.log('exports ok')"
+
+  build:
+    name: Build Windows installer
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Tag builds take their version from the tag (v1.2.3 -> 1.2.3).
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: npm version --no-git-tag-version "${GITHUB_REF_NAME#v}"
+
+      - name: Build installer and portable exe
+        run: npx electron-builder --config electron-builder.config.js --win nsis portable --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      # The installer must carry the pipeline (with the Anthropic SDK) and nothing big: without
+      # the config file electron-builder packs the whole folder.
+      - name: Check bundle contents
+        shell: bash
+        run: |
+          r=dist/win-unpacked/resources
+          for f in pipeline/process.js pipeline/deps-check.js pipeline/llm/index.js pipeline/transcribe.py pipeline/setup-whisper.ps1 pipeline/node_modules/@anthropic-ai/sdk/package.json; do
+            test -f "$r/$f" || { echo "missing $f"; exit 1; }
+          done
+          size=$(du -sm "$r" | cut -f1); echo "resources: ${size} MB"
+          [ "$size" -lt 200 ] || { echo "resources too large"; exit 1; }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: video-notes-windows
+          path: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest.yml
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: video-notes-windows
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.exe \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Video Notes $GITHUB_REF_NAME" \
+            --generate-notes

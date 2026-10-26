@@ -1,10 +1,17 @@
 {
   "name": "video-notes-pipeline",
+  "productName": "Video Notes",
   "version": "1.0.0",
   "description": "Extract text from video, fix transcription errors, and generate study notes",
-  "main": "process.js",
+  "main": "gui/main.js",
   "scripts": {
-    "start": "node process.js"
+    "start": "node process.js",
+    "check": "node deps-check.js",
+    "test": "node --test \"test/**/*.test.js\"",
+    "gui": "electron .",
+    "dist": "electron-builder --config electron-builder.config.js --win nsis portable",
+    "dist:installer": "electron-builder --config electron-builder.config.js --win nsis",
+    "dist:portable": "electron-builder --config electron-builder.config.js --win portable"
   },
   "keywords": [
     "video",
@@ -13,6 +20,13 @@
     "claude",
     "study-notes"
   ],
-  "author": "",
-  "license": "MIT"
+  "author": "Pravesh Shrestha",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "44.9.1",
+    "electron-builder": "26.15.3"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.135.0"
+  }
 }
