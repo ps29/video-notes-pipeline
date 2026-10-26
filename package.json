@@ -6,6 +6,7 @@
   "main": "gui/main.js",
   "scripts": {
     "start": "node process.js",
+    "check": "node deps-check.js",
     "gui": "electron .",
     "dist": "electron-builder --win nsis portable",
     "dist:installer": "electron-builder --win nsis",

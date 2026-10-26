@@ -27,6 +27,7 @@
 
   <nav class="tabs">
     <button class="tab active" data-tab="monitor">Monitor</button>
+    <button class="tab" data-tab="deps">Dependencies</button>
     <button class="tab" data-tab="settings">Settings</button>
     <div class="spacer"></div>
     <div id="checks" class="checks"></div>
@@ -61,6 +62,54 @@
           <button id="log-open">Log files</button>
         </div>
         <div id="log" class="log"></div>
+      </div>
+    </section>
+
+    <section id="tab-deps" class="tab-panel hidden">
+      <div class="deps-scroll">
+        <div class="deps-intro">
+          <p>
+            Video Notes doesn't install anything for you. Each item below says what it's for, whether it was found,
+            and how to install it. Run the commands yourself (or follow the links), then press <strong>Check again</strong>.
+            The same check runs in a terminal with <code>npm run check</code>.
+          </p>
+          <div class="deps-actions">
+            <button id="deps-check" class="primary">Check again</button>
+            <button id="deps-test-gpu" title="Transcribes an 11-second sample with whisper.cpp and reports whether the GPU was used">Test GPU</button>
+            <button id="deps-test-claude" title="Sends one short request with the model set in Settings">Test Claude login</button>
+            <button id="deps-terminal" title="Opens PowerShell in the pipeline folder, where the install commands should be run">Open PowerShell here</button>
+            <span id="deps-summary" class="muted"></span>
+          </div>
+        </div>
+        <div id="deps-tests" class="deps-list"></div>
+        <div id="deps-list" class="deps-list"></div>
+
+        <h2>Models</h2>
+        <p class="muted">
+          Listed live from Hugging Face (only when you press the button). Information only: download a model with the command shown,
+          then choose it here or in Settings.
+        </p>
+        <div class="deps-actions">
+          <button id="models-load">Load model list from Hugging Face</button>
+          <label><input type="checkbox" id="models-english" checked> English-only Whisper models</label>
+          <span id="models-status" class="muted"></span>
+        </div>
+        <div id="models" class="hidden">
+          <h3>Whisper (speech-to-text) · <a href="#" data-href="https://huggingface.co/ggerganov/whisper.cpp">ggerganov/whisper.cpp</a></h3>
+          <table class="models">
+            <thead><tr><th>Model</th><th>Size</th><th>Status</th><th>Download command</th><th></th></tr></thead>
+            <tbody id="models-whisper"></tbody>
+          </table>
+          <h3>Vision (optional, for screenshot descriptions)</h3>
+          <p class="muted">
+            Only needed for llama.cpp. If Lemonade Server is running, the pipeline uses its model instead.
+            Download both files into <code>tools\models</code>, then press <strong>Use</strong>.
+          </p>
+          <table class="models">
+            <thead><tr><th>Repository</th><th>Model file</th><th>mmproj file</th><th>Total</th><th></th></tr></thead>
+            <tbody id="models-vision"></tbody>
+          </table>
+        </div>
       </div>
     </section>
 

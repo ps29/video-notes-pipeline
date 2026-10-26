@@ -27,8 +27,14 @@ LLAMA_SERVER = os.environ.get("LLAMA_SERVER") or os.path.join(
 LEMONADE_URL = (os.environ.get("LEMONADE_URL") or "http://localhost:13305/api/v1").rstrip("/")
 LEMONADE_MODEL = os.environ.get("LEMONADE_MODEL") or "Qwen3-VL-8B-Instruct-GGUF"
 MODELS_DIR = os.path.join(ROOT, "tools", "models")
-MODEL = os.environ.get("VLM_MODEL") or os.path.join(MODELS_DIR, "Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf")
-MMPROJ = os.environ.get("VLM_MMPROJ") or os.path.join(MODELS_DIR, "mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf")
+# VLM_MODEL / VLM_MMPROJ: a full path, or a file name in tools/models.
+def model_path(env_name, default):
+    value = os.environ.get(env_name) or default
+    return value if os.path.dirname(value) else os.path.join(MODELS_DIR, value)
+
+
+MODEL = model_path("VLM_MODEL", "Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf")
+MMPROJ = model_path("VLM_MMPROJ", "mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf")
 
 PROMPT = """This image is a frame from a computer science lecture video. Respond with JSON only, in this shape:
 {"description": "<2-3 sentences: what the slide/diagram/code shows and its topic>", "text": "<on-screen text or code transcribed as exactly as you can, or empty string if none>"}"""
@@ -120,10 +126,28 @@ def resolve_frames_dirs(arg):
     return sorted(found) or [arg]
 
 
+def check():
+    """Prints, as JSON, which vision backend is available (for deps-check.js)."""
+    print(json.dumps({
+        "lemonade_url": LEMONADE_URL,
+        "lemonade_model": LEMONADE_MODEL,
+        "lemonade_up": lemonade_up(),
+        "llama_server": LLAMA_SERVER,
+        "llama_server_exists": os.path.exists(LLAMA_SERVER),
+        "model": MODEL,
+        "model_exists": os.path.exists(MODEL),
+        "mmproj": MMPROJ,
+        "mmproj_exists": os.path.exists(MMPROJ),
+    }))
+
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python frame_analyze.py <frames-dir | video | folder>", file=sys.stderr)
+        print("Usage: python frame_analyze.py <frames-dir | video | folder> | --check", file=sys.stderr)
         sys.exit(1)
+    if sys.argv[1] == "--check":
+        check()
+        return
     dirs = resolve_frames_dirs(sys.argv[1])
     for frames_dir in dirs:
         if len(dirs) > 1:

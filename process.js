@@ -19,6 +19,15 @@ const DEFAULT_SETTINGS = {
   // Claude model used for every CLI call in the pipeline.
   CLAUDE_MODEL: 'claude-haiku-5-5',
 
+  // Whisper model file in tools/whisper.cpp/models (e.g. ggml-small.en.bin), or a full path.
+  // Empty = the most accurate model downloaded. Download others with setup-whisper.ps1 -Model.
+  WHISPER_MODEL: '',
+
+  // llama.cpp vision model and its mmproj file in tools/models (or full paths), used when
+  // Lemonade Server isn't running. Empty = the Qwen2.5-VL-3B files setup-llama.ps1 downloads.
+  VISION_MODEL: '',
+  VISION_MMPROJ: '',
+
   // If a video already has an .srt subtitle file, use it as the transcript instead of
   // running Whisper (faster, and human captions are usually more accurate on technical
   // terms). Looked up as <videoFolder>_subtitles/<name>.srt, then <videoFolder>/<name>.srt.
@@ -69,7 +78,8 @@ const settings = loadSettings();
 const {
   ENABLE_SCREENSHOTS, CLAUDE_MODEL, USE_SUBTITLES, SKIP_FIX_FOR_SUBTITLES,
   AUDIO_CONCURRENCY, WHISPER_CONCURRENCY, CLAUDE_CONCURRENCY, FRAME_CLASSIFY_CONCURRENCY,
-  SCENE_CHANGE_THRESHOLD, SSIM_DUPLICATE_THRESHOLD, PLACEMENT_WINDOW_SECONDS,
+  SCENE_CHANGE_THRESHOLD, SSIM_DUPLICATE_THRESHOLD, PLACEMENT_WINDOW_SECONDS, WHISPER_MODEL,
+  VISION_MODEL, VISION_MMPROJ,
 } = settings;
 
 // When forked by the GUI (gui/main.js), log lines and stage changes go to the parent
@@ -398,7 +408,10 @@ async function analyzeFrames(framesDir) {
   log.info(`[analyze] Describing kept frames with the local vision model...`);
   try {
     const venvPython = path.join(__dirname, '.venv', 'Scripts', 'python.exe');
-    await spawnStreaming(venvPython, [path.join(__dirname, 'frame_analyze.py'), framesDir]);
+    const env = { ...process.env };
+    if (VISION_MODEL) env.VLM_MODEL = VISION_MODEL;
+    if (VISION_MMPROJ) env.VLM_MMPROJ = VISION_MMPROJ;
+    await spawnStreaming(venvPython, [path.join(__dirname, 'frame_analyze.py'), framesDir], { env });
     log.info(`✓ Frame descriptions saved: ${path.join(framesDir, 'descriptions.json')}`);
   } catch (err) {
     log.warn(`Local frame analysis skipped (run setup-llama.ps1?): ${(err.stderr || err.message).toString().trim().split('\n').pop()}`);
@@ -444,7 +457,8 @@ async function transcribe(audioPath) {
   log.info(`[transcribe] Transcribing ${path.basename(audioPath)} with whisper.cpp (GPU)...`);
   try {
     const venvPython = path.join(__dirname, '.venv', 'Scripts', 'python.exe');
-    const { stdout } = await spawnStreaming(venvPython, [path.join(__dirname, 'transcribe.py'), audioPath]);
+    const env = WHISPER_MODEL ? { ...process.env, WHISPER_MODEL } : process.env;
+    const { stdout } = await spawnStreaming(venvPython, [path.join(__dirname, 'transcribe.py'), audioPath], { env });
     writeFileAtomic(transcriptPath, stdout.trim());
     log.info(`✓ Raw transcript saved: ${transcriptPath}`);
     return transcriptPath;
@@ -903,7 +917,7 @@ function worker() {
   send({ type: 'ready', settings });
 }
 
-module.exports = { run, resetVideo, findVideos, DEFAULT_SETTINGS, SETTINGS_PATH, VIDEO_EXTENSIONS };
+module.exports = { run, resetVideo, findVideos, findSubtitle, DEFAULT_SETTINGS, SETTINGS_PATH, VIDEO_EXTENSIONS };
 
 if (require.main === module) {
   if (WORKER_MODE) worker();

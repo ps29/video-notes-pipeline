@@ -39,6 +39,9 @@ jobs:
       - name: Syntax check (Python)
         run: python -I -m py_compile transcribe.py frame_analyze.py
 
+      - name: Syntax check (deps-check)
+        run: node --check deps-check.js
+
       # Forks process.js the way the GUI does and checks it reports over IPC and ends cleanly
       # (no ffmpeg/Claude needed: the input path does not exist).
       - name: Worker smoke test
@@ -58,6 +61,22 @@ jobs:
               process.exit(ok ? 0 : 1);
             });
           "
+
+      # The runner has none of the tools, so "missing" results are expected; this only checks
+      # that the checker runs and reports every dependency with an install hint.
+      - name: Dependency check
+        shell: bash
+        run: |
+          node deps-check.js --json > deps.json || true
+          node -e "
+            const r = require('./deps.json');
+            const ids = r.results.map(x => x.id);
+            for (const id of ['ffmpeg','pandoc','claude','python','whisper','vulkan','vision']) if (!ids.includes(id)) throw new Error('missing check ' + id);
+            for (const x of r.results) if (!['ok','warn','missing','off'].includes(x.status) || !x.install?.length) throw new Error('bad result ' + x.id);
+            console.log(r.results.map(x => x.id + '=' + x.status).join(' '));
+          "
+          python -I transcribe.py --check
+          python -I frame_analyze.py --check
 
       - name: Module exports
         run: node -e "const m = require('./process.js'); for (const k of ['run','resetVideo','DEFAULT_SETTINGS','VIDEO_EXTENSIONS']) if (!(k in m)) throw new Error('missing export ' + k); console.log('exports ok')"

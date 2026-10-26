@@ -23,6 +23,9 @@ const SETTING_HELP = {
   SCENE_CHANGE_THRESHOLD: 'ffmpeg scene score for candidate frames. Higher = fewer frames.',
   SSIM_DUPLICATE_THRESHOLD: 'Frames at least this similar to the last kept frame are dropped.',
   PLACEMENT_WINDOW_SECONDS: 'One screenshot per window of this many seconds.',
+  WHISPER_MODEL: 'Whisper model file in tools\\whisper.cpp\\models. Empty = the most accurate one downloaded. See Dependencies → Models.',
+  VISION_MODEL: 'llama.cpp vision model file in tools\\models. Empty = Qwen2.5-VL-3B from setup-llama.ps1.',
+  VISION_MMPROJ: 'The matching mmproj file in tools\\models.',
 };
 
 const MAX_LOG_LINES = 20000; // kept in memory
@@ -73,10 +76,12 @@ async function call(fn, ...args) {
   }
 }
 
-function showBanner(text, action) {
+function showBanner(text, ...actions) {
   const banner = $('banner');
   banner.replaceChildren(text);
-  if (action) banner.append(el('button', { textContent: action.label, on: { click: action.fn } }));
+  for (const action of actions.filter(Boolean)) {
+    banner.append(el('button', { textContent: action.label, on: { click: action.fn } }));
+  }
   banner.classList.remove('hidden');
 }
 
@@ -322,10 +327,28 @@ function onPipeline(msg) {
   }
 }
 
-async function start() {
+async function start({ skipCheck = false } = {}) {
   const input = $('input-path').value.trim().replace(/^"|"$/g, '');
   if (!input) return showBanner('Choose a video file or folder first.');
   hideBanner();
+
+  if (!skipCheck) {
+    $('start').disabled = true;
+    $('start').textContent = 'Checking…';
+    const pre = await call(window.api.precheck, input);
+    $('start').textContent = 'Start';
+    $('start').disabled = false;
+    if (pre && (pre.missing.length || pre.warnings.length)) {
+      const list = items => items.map(i => i.name).join(', ');
+      const text = pre.missing.length
+        ? `This run needs ${list(pre.missing)}, which ${pre.missing.length > 1 ? 'were' : 'was'} not found. Videos that need ${pre.missing.length > 1 ? 'them' : 'it'} will fail.`
+        : `Heads up: ${pre.warnings.map(w => `${w.name}: ${w.detail}`).join(' ')}`;
+      return showBanner(text,
+        { label: 'View dependencies', fn: () => { hideBanner(); showTab('deps'); } },
+        { label: 'Start anyway', fn: () => start({ skipCheck: true }) });
+    }
+  }
+
   state.videos.clear();
   state.selectedVideo = '';
   state.result = null;
@@ -395,17 +418,183 @@ async function saveSettings() {
   }
 }
 
+// ---------- dependencies ----------
+
+const depsState = { results: null, tests: new Map(), models: null, checking: false };
+
+function showTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('hidden', p.id !== `tab-${name}`));
+  if (name === 'deps' && !depsState.results && !depsState.checking) checkDeps();
+}
+
+const STATUS_LABEL = { ok: 'OK', warn: 'Check', missing: 'Missing', off: 'Not needed', checking: 'Checking' };
+
+function renderBadges(checks) {
+  $('checks').replaceChildren(...checks.map(c => el('span', {
+    class: `check ${c.status === 'ok' ? '' : c.status}`,
+    textContent: c.status === 'missing' ? `${c.name} missing` : c.name,
+    title: `${c.title || c.status} (click for details)`,
+    on: { click: () => showTab('deps') },
+  })));
+}
+
+function linkButton(url, label) {
+  return el('a', { href: '#', textContent: label || url, on: { click: e => { e.preventDefault(); call(window.api.openExternal, url); } } });
+}
+
+function copyButton(text) {
+  const btn = el('button', { class: 'small', textContent: 'Copy' });
+  btn.addEventListener('click', async () => {
+    await call(window.api.copy, text);
+    btn.textContent = 'Copied';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 1200);
+  });
+  return btn;
+}
+
+function renderInstall(options) {
+  return el('div', { class: 'install' }, ...options.map(o => el('div', { class: 'install-row' },
+    el('span', { class: 'install-label', textContent: o.label }),
+    o.command ? el('code', { textContent: o.command }) : null,
+    o.command ? copyButton(o.command) : null,
+    o.url ? linkButton(o.url) : null,
+    o.note ? el('div', { class: 'install-note', textContent: o.note }) : null,
+  )));
+}
+
+function renderDep(r) {
+  const open = r.status === 'missing' || r.status === 'warn';
+  const install = r.install ? renderInstall(r.install) : null;
+  return el('div', { class: `dep ${r.status}` },
+    el('div', { class: 'dep-head' },
+      el('span', { class: `status ${r.status}`, textContent: STATUS_LABEL[r.status] || r.status }),
+      el('span', { class: 'dep-name', textContent: r.name }),
+      r.version ? el('span', { class: 'dep-version', textContent: r.version }) : null,
+      r.neededFor ? el('span', { class: 'dep-need', textContent: r.neededFor }) : null,
+    ),
+    r.purpose ? el('p', { class: 'dep-purpose', textContent: r.purpose }) : null,
+    r.detail ? el('p', { class: 'dep-detail', textContent: r.detail }) : null,
+    r.path ? el('div', { class: 'dep-path', textContent: r.path }) : null,
+    install && (open ? install : el('details', {}, el('summary', { textContent: 'How to install' }), install)),
+  );
+}
+
+function renderDeps() {
+  const results = depsState.results || [];
+  $('deps-list').replaceChildren(...results.map(renderDep));
+  $('deps-tests').replaceChildren(...[...depsState.tests.values()].map(renderDep));
+  const count = s => results.filter(r => r.status === s).length;
+  $('deps-summary').textContent = depsState.checking ? 'Checking…'
+    : results.length ? `${count('ok')} OK · ${count('warn')} to check · ${count('missing')} missing` : '';
+}
+
+async function checkDeps() {
+  depsState.checking = true;
+  $('deps-check').disabled = true;
+  renderDeps();
+  const report = await call(window.api.checkDeps);
+  depsState.checking = false;
+  $('deps-check').disabled = false;
+  if (report) {
+    depsState.results = report.results;
+    renderBadges(report.results.filter(r => ['ffmpeg', 'pandoc', 'claude', 'python', 'whisper'].includes(r.id))
+      .map(r => ({ id: r.id, name: r.name, status: r.status, title: [r.version, r.detail].filter(Boolean).join(' — ') })));
+  }
+  renderDeps();
+}
+
+async function runDepTest(which, button) {
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Testing…';
+  depsState.tests.set(which, { id: which, name: label, status: 'checking', detail: 'Running…' });
+  renderDeps();
+  const result = await call(window.api.testDep, which);
+  if (result) depsState.tests.set(which, result); else depsState.tests.delete(which);
+  button.disabled = false;
+  button.textContent = label;
+  renderDeps();
+}
+
+const formatSize = n => (n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${Math.round(n / 1e6)} MB`);
+
+async function loadModels() {
+  $('models-load').disabled = true;
+  $('models-status').textContent = 'Contacting huggingface.co…';
+  const models = await call(window.api.fetchModels);
+  $('models-load').disabled = false;
+  if (!models) { $('models-status').textContent = 'Could not load the list. Check your connection and try again.'; return; }
+  depsState.models = models;
+  $('models-status').textContent = `Loaded ${new Date(models.fetchedAt).toLocaleTimeString()}`;
+  $('models-load').textContent = 'Reload';
+  $('models').classList.remove('hidden');
+  renderModels();
+}
+
+async function useSetting(pairs, message) {
+  for (const [key, value] of pairs) {
+    if (await call(window.api.setSetting, key, value) === undefined) return;
+  }
+  log({ type: 'log', level: 'info', video: null, ts: Date.now(), msg: message });
+  await loadSettings();
+  await loadModels();
+  checkDeps();
+}
+
+function renderModels() {
+  const models = depsState.models;
+  if (!models) return;
+  const englishOnly = $('models-english').checked;
+  let lastFamily = null;
+  $('models-whisper').replaceChildren(...models.whisper
+    .filter(m => !englishOnly || m.english || m.family.startsWith('large'))
+    .map(m => {
+      const status = m.inUse ? 'In use' : m.installed ? 'Downloaded' : '';
+      const row = el('tr', { class: m.family !== lastFamily ? 'family-start' : '' },
+        el('td', { class: 'mono', textContent: m.name, title: `sha256 ${m.sha256 || 'n/a'}` }),
+        el('td', { class: 'size', textContent: formatSize(m.size) }),
+        el('td', {}, status ? el('span', { class: `status ${m.inUse ? 'ok' : 'off'}`, textContent: status }) : null),
+        el('td', {}, el('code', { textContent: m.command }), ' ', copyButton(m.command)),
+        el('td', {}, m.installed && !m.inUse ? el('button', {
+          class: 'small', textContent: 'Use', disabled: state.running,
+          on: { click: () => useSetting([['WHISPER_MODEL', m.name]], `Whisper model set to ${m.name}.`) },
+        }) : null),
+      );
+      lastFamily = m.family;
+      return row;
+    }));
+
+  const inUse = models.visionInUse;
+  $('models-vision').replaceChildren(...models.vision.map(v => {
+    if (v.error) return el('tr', {}, el('td', {}, linkButton(v.url, v.repo)), el('td', { colSpan: 4, class: 'muted', textContent: v.error }));
+    const file = f => el('td', {},
+      el('span', { class: 'mono', textContent: f.name }), ' ',
+      el('span', { class: 'muted', textContent: `(${formatSize(f.size)})` }), ' ',
+      f.installed ? el('span', { class: 'status off', textContent: 'Downloaded' }) : linkButton(f.url, 'Download'));
+    const ready = v.model.installed && v.mmproj.installed;
+    const active = inUse.model ? inUse.model === v.model.name : v.model.name === 'Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf';
+    return el('tr', {},
+      el('td', {}, linkButton(v.url, v.repo)),
+      file(v.model),
+      file(v.mmproj),
+      el('td', { class: 'size', textContent: formatSize(v.model.size + v.mmproj.size) }),
+      el('td', {}, active && ready ? el('span', { class: 'status ok', textContent: 'In use' })
+        : ready ? el('button', {
+          class: 'small', textContent: 'Use', disabled: state.running,
+          on: { click: () => useSetting([['VISION_MODEL', v.model.name], ['VISION_MMPROJ', v.mmproj.name]], `Vision model set to ${v.model.name}.`) },
+        }) : null),
+    );
+  }));
+}
+
 // ---------- startup ----------
 
 async function refreshInfo() {
   const info = await call(window.api.info);
   if (!info) return;
   $('choose-root').textContent = info.pipelineRoot ? `Pipeline: ${info.pipelineRoot}` : 'Choose pipeline folder';
-  $('checks').replaceChildren(...info.checks.map(c => el('span', {
-    class: `check ${c.path ? '' : 'missing'}`,
-    textContent: c.path ? c.name : `${c.name} missing`,
-    title: c.path || `${c.name} was not found. See the README prerequisites.`,
-  })));
+  renderBadges(info.checks);
   if (!info.pipelineRoot) {
     showBanner('Pipeline folder not found. Choose the folder that contains process.js, .venv and tools/.',
       { label: 'Choose…', fn: chooseRoot });
@@ -428,7 +617,7 @@ function init() {
 
   $('pick-file').addEventListener('click', async () => { const p = await call(window.api.pick, 'file'); if (p) $('input-path').value = p; });
   $('pick-folder').addEventListener('click', async () => { const p = await call(window.api.pick, 'folder'); if (p) $('input-path').value = p; });
-  $('start').addEventListener('click', start);
+  $('start').addEventListener('click', () => start());
   $('stop').addEventListener('click', stop);
   $('choose-root').addEventListener('click', chooseRoot);
 
@@ -445,9 +634,18 @@ function init() {
     $('settings-msg').textContent = 'Defaults restored in the form. Press Save to apply.';
   });
 
-  document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => {
-    document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t === tab));
-    document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('hidden', p.id !== `tab-${tab.dataset.tab}`));
+  document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => showTab(tab.dataset.tab)));
+
+  $('deps-check').addEventListener('click', checkDeps);
+  $('deps-test-gpu').addEventListener('click', () => runDepTest('gpu', $('deps-test-gpu')));
+  $('deps-test-claude').addEventListener('click', () => runDepTest('claude', $('deps-test-claude')));
+  $('deps-terminal').addEventListener('click', () => call(window.api.openTerminal));
+  $('models-load').addEventListener('click', loadModels);
+  $('models-english').addEventListener('change', renderModels);
+  // Static links in index.html open in the browser, not inside the app.
+  document.querySelectorAll('a[data-href]').forEach(a => a.addEventListener('click', e => {
+    e.preventDefault();
+    call(window.api.openExternal, a.dataset.href);
   }));
 
   // Drop a video or folder onto the window to fill the path.
